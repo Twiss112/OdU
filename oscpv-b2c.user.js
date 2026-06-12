@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         OSCPV B2C — Пошук полісів (Odoo + Universalna)
 // @namespace    universalna.oscpv.b2c
-// @version      2.7.1-b2c
-// @description  B2C: ОСЦПВ + дані авто через вкладку-проксі carplates.app
-// @author       custom
+// @version      2.13.0-b2c
+// @description  B2C: ОСЦПВ + дані авто (carplates) + дата початку полісу (бінарний пошук через dict/import-tool)
+// @author       Universalna Baza
 // @match        https://odoo.icu.int/*
+// @match        https://odoo.universalna.com/*
 // @match        https://dict.universalna.com/*
 // @match        https://ua.carplates.app/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
@@ -14,6 +15,7 @@
 // @grant        GM_deleteValue
 // @grant        GM_addValueChangeListener
 // @grant        GM_removeValueChangeListener
+// @grant        unsafeWindow
 // @connect      import-tool.universalna.com
 // @connect      dict.universalna.com
 // @run-at       document-start
@@ -29,7 +31,7 @@
         TABLE_URL: 'https://dict.universalna.com/table/444',
         INSERT_URL: 'https://dict.universalna.com/api/24/insert/InsuredLoss?zip=true&idtbl=444',
         RUN_URL: 'https://import-tool.universalna.com/api/task/MtsbuInsuredLoss_PROD/run',
-        DELAY_AFTER_RUN: 6000,
+        DELAY_AFTER_RUN: 1500,
         DELAY_BETWEEN_IPN: 1500,
         ROW_WAIT_TIMEOUT: 30000,
         ROW_WAIT_INTERVAL: 500,
@@ -39,6 +41,7 @@
         CARPLATES_API_URL: 'https://api.carplates.app/summary', // що перехоплювати у вкладці
         CARPLATES_TIMEOUT: 25000,   // мс - макс. час очікування у вкладці carplates
         CARPLATES_DELAY: 800,       // мс - пауза між VIN-запитами
+
     };
 
     // Глобальне сховище актуального токена — оновлюється при кожному запиті сайту
@@ -66,7 +69,26 @@
                         LIVE_TOKEN = auth.slice(7);
                     }
                 } catch(e) {}
-                return origFetch.apply(this, arguments);
+                const result = origFetch.apply(this, arguments);
+                // Capture SELECT/export API responses + auto-discover working URL
+                try {
+                    const url = typeof input === 'string' ? input : (input?.url ?? '');
+                    if (url && url.includes('InsuredLoss') && !url.includes('/insert')) {
+                        result.then(resp => {
+                            if (!resp.ok) return;
+                            const ct = resp.headers.get('content-type') || '';
+                            if (ct.includes('json')) {
+                                resp.clone().json().then(data => {
+                                    _storeTableCache(data, url);
+                                }).catch(() => {});
+                            } else if (ct.includes('spreadsheet') || ct.includes('octet') || ct.includes('xlsx')) {
+                                // Binary XLSX from download button — store URL for GM_xmlhttpRequest
+                                GM_setValue('dict444_dl_url', url.split('?')[0]);
+                            }
+                        }).catch(() => {});
+                    }
+                } catch(e) {}
+                return result;
             };
 
             const origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
@@ -78,10 +100,148 @@
                 } catch(e) {}
                 return origSetHeader.apply(this, arguments);
             };
-            console.log('[OSCPV] Token sniffer installed');
+
+            // Capture XHR responses too (in case page uses XHR instead of fetch)
+            const origXHROpen = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function(method, url) {
+                if (url && typeof url === 'string' && url.includes('InsuredLoss') && !url.includes('/insert')) {
+                    this._oscpv_capture = true;
+                }
+                return origXHROpen.apply(this, arguments);
+            };
+            const origXHRSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.send = function() {
+                if (this._oscpv_capture) {
+                    this.addEventListener('load', () => {
+                        if (this.status === 200) {
+                            try { _storeTableCache(JSON.parse(this.responseText)); } catch(e) {}
+                        }
+                    });
+                }
+                return origXHRSend.apply(this, arguments);
+            };
+
+            console.log('[OSCPV] Token sniffer + table cache interceptor installed');
         } catch(e) {
             console.warn('[OSCPV] Could not install sniffer:', e);
         }
+    }
+
+    function _storeTableCache(data, sourceUrl) {
+        try {
+            const rows = Array.isArray(data) ? data :
+                         Array.isArray(data?.data) ? data.data :
+                         Array.isArray(data?.rows) ? data.rows :
+                         Array.isArray(data?.items) ? data.items : null;
+            if (!rows || !rows.length) return;
+            // Store only id + response to keep size small
+            const minimal = rows
+                .map(r => ({ id: parseInt(r.id ?? r.ID ?? 0), resp: (r.response ?? r.resp ?? r.RESPONSE ?? '').toString() }))
+                .filter(r => r.id > 0)
+                .sort((a, b) => a.id - b.id)
+                .slice(-600);
+            GM_setValue('dict444_api_cache', JSON.stringify({ ts: Date.now(), rows: minimal }));
+            // Auto-save the working JSON endpoint URL for direct GM_xmlhttpRequest access
+            if (sourceUrl && !GM_getValue('dict444_dl_url', '')) {
+                GM_setValue('dict444_dl_url', sourceUrl.split('?')[0]);
+            }
+        } catch(e) {}
+    }
+
+    // ─── GM_xmlhttpRequest promise wrapper ───────────────────────────────────
+    function gmXHR(opts) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest(Object.assign({}, opts, {
+                onload:   resolve,
+                onerror:  () => reject(new Error('network error')),
+                ontimeout: () => reject(new Error('timeout'))
+            }));
+        });
+    }
+
+    // Parse XLSX arraybuffer → [{id, resp}], using header row or fallback to COL positions
+    function parseXLSXRows(buffer) {
+        try {
+            const wb = XLSX.read(new Uint8Array(buffer), { type: 'array' });
+            if (!wb.SheetNames.length) return null;
+            const ws = wb.Sheets[wb.SheetNames[0]];
+            const data = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+            if (data.length < 2) return null;
+            const hdr = data[0].map(h => (h || '').toString().toLowerCase().trim());
+            let idCol   = hdr.findIndex(h => h === 'id');
+            let respCol = hdr.findIndex(h => h === 'response');
+            if (idCol   < 0) idCol   = COL.ID;       // fallback: col 0
+            if (respCol < 0) respCol = COL.RESPONSE;  // fallback: col 18
+            return data.slice(1)
+                .map(r => ({ id: parseInt(r[idCol] || 0) || 0, resp: (r[respCol] || '').toString().trim() }))
+                .filter(r => r.id > 0);
+        } catch(e) {
+            console.warn('[OSCPV] parseXLSXRows:', e);
+            return null;
+        }
+    }
+
+    // Direct table fetch via GM_xmlhttpRequest (no iframe needed).
+    // Tries cached URL first, then common patterns. Supports JSON and XLSX.
+    // Returns [{id, resp}] or null on failure.
+    async function fetchTableRowsDirect() {
+        const token = getCurrentToken();
+        if (!token) return null;
+
+        const saved = GM_getValue('dict444_dl_url', '');
+        const base  = 'https://dict.universalna.com/api/24/';
+        const candidates = [
+            ...(saved ? [saved] : []),
+            base + 'select/InsuredLoss',
+            base + 'export/InsuredLoss',
+            base + 'download/InsuredLoss',
+        ].filter((u, i, a) => a.indexOf(u) === i); // deduplicate
+
+        for (const url of candidates) {
+            const full = url.includes('idtbl') ? url : url + '?idtbl=444';
+            try {
+                // Try JSON
+                const rj = await gmXHR({
+                    method: 'GET', url: full,
+                    headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' },
+                    timeout: 15000
+                });
+                if (rj.status === 200) {
+                    const ct = (rj.responseHeaders || '').toLowerCase();
+                    if (!ct.includes('spreadsheet') && !ct.includes('octet')) {
+                        const data = JSON.parse(rj.responseText);
+                        const rows = Array.isArray(data) ? data :
+                                     Array.isArray(data?.data) ? data.data :
+                                     Array.isArray(data?.rows) ? data.rows : null;
+                        if (rows?.length) {
+                            GM_setValue('dict444_dl_url', url);
+                            return rows.map(r => ({
+                                id:   parseInt(r.id ?? r.ID ?? 0) || 0,
+                                resp: (r.response ?? r.resp ?? r.RESPONSE ?? '').toString()
+                            })).filter(r => r.id > 0);
+                        }
+                    }
+                }
+
+                // Try XLSX (arraybuffer)
+                const rx = await gmXHR({
+                    method: 'GET', url: full,
+                    headers: { 'Authorization': 'Bearer ' + token },
+                    responseType: 'arraybuffer',
+                    timeout: 20000
+                });
+                if (rx.status === 200 && rx.response) {
+                    const rows = parseXLSXRows(rx.response);
+                    if (rows?.length) {
+                        GM_setValue('dict444_dl_url', url);
+                        return rows;
+                    }
+                }
+            } catch(e) {
+                console.log('[OSCPV] fetchTableRowsDirect failed:', url, e.message);
+            }
+        }
+        return null;
     }
 
     // ====== Колонки таблиці (порядок з HTML el-table_1_column_N) ======
@@ -99,8 +259,10 @@
     //                    РОУТИНГ ПО САЙТАМ
     // =====================================================================
     const host = location.hostname;
+    // Обидва домени Odoo - старий і новий
+    const isOdooHost = (host === 'odoo.icu.int' || host === 'odoo.universalna.com');
 
-    if (host === 'odoo.icu.int') {
+    if (isOdooHost) {
         initOdooSide();
     } else if (host === 'dict.universalna.com') {
         initDictSide();
@@ -210,7 +372,7 @@
                         <div class="oscpv-card-title">
                             <span><span class="oscpv-icon">📋</span>Дані для пошуку</span>
                             <button class="oscpv-auto-btn" id="oscpv-auto" title="Знайти ІПН клієнта з поточного ліда">
-                                <span class="oscpv-ico-sm">🪄</span>
+                                <span class="oscpv-ico-sm">🔵</span>
                                 Авто-ІПН з ліда
                             </button>
                         </div>
@@ -243,6 +405,15 @@
                             <span class="oscpv-toggle-text">
                                 <span>🚗 Парсити дані авто з carplates.app</span>
                                 <span class="oscpv-toggle-hint">Додає марку, модель, рік, паливо, об'єм двигуна, масу, місць, регіон</span>
+                            </span>
+                        </label>
+
+                        <label class="oscpv-toggle">
+                            <input type="checkbox" id="oscpv-mtsbu-enable">
+                            <span class="oscpv-toggle-slider"></span>
+                            <span class="oscpv-toggle-text">
+                                <span>📅 Початок полісу</span>
+                                <span class="oscpv-toggle-hint">Бінарний пошук дати початку полісу через dict/import-tool. 1 запит за крок, ~9 кроків на авто.</span>
                             </span>
                         </label>
                     </div>
@@ -348,16 +519,12 @@
     }
 
     /**
-     * Витягує ІПН клієнта з поточного ліда CRM через Odoo web_read API.
-     * URL поточного ліда має формат:
-     *   odoo.icu.int/web#id=366339&model=crm.lead&...
-     * Робимо POST на /web/dataset/call_kw з model=crm.lead, method=web_read.
-     * З partner_id.display_name витягуємо останню послідовність з 10 цифр.
-     */
-    /**
      * Витягує ІПН клієнта зі сторінки ліда CRM.
      * Просто читаємо значення з input#partner_id_1 (поле "Клієнт" у формі).
      * Очікуваний формат: "Прізвище Ім'я По-батькові ‒ 1234567890"
+     *
+     * ЗМІНА (v2.8): при автопошуку старий ІПН у полі ЗАМІНЮЄТЬСЯ новим,
+     * а не дописується (зручно на новій картці клієнта).
      */
     async function autoFillIpnFromLead() {
         const btn = document.getElementById('oscpv-auto');
@@ -369,7 +536,6 @@
             btn.textContent = '⏳ Шукаю...';
 
             // 1. Шукаємо поле "Клієнт" на сторінці ліда
-            // Спершу пробуємо точний id, потім ширше — будь-який input всередині name="partner_id"
             let partnerInput = document.getElementById('partner_id_1');
             if (!partnerInput || !partnerInput.value) {
                 const wrap = document.querySelector('[name="partner_id"]');
@@ -392,7 +558,6 @@
             }
 
             // 2. Витягуємо 10-значний ІПН (остання послідовність з 10 цифр у рядку)
-            // Формат: "Прізвище Ім'я По-батькові ‒ 2099205955"
             const matches = displayName.match(/\b\d{10}\b/g);
             if (!matches || !matches.length) {
                 alert(`У імені клієнта не знайдено 10-значного ІПН.\n\nЗначення: "${displayName}"`);
@@ -400,13 +565,12 @@
             }
             const ipn = matches[matches.length - 1];
 
-            // 3. Підставляємо у textarea
-            const cur = textarea.value.trim();
-            if (cur && !cur.split('\n').includes(ipn)) {
-                textarea.value = cur + '\n' + ipn;
-            } else if (!cur) {
-                textarea.value = ipn;
-            }
+            // 3. ЗАМІНЮЄМО вміст поля новим ІПН (не дописуємо)
+            textarea.value = ipn;
+            const counter = document.getElementById('oscpv-counter');
+            if (counter) counter.textContent = '1 ІПН';
+            // Кидаємо input event щоб лічильник/слухачі оновились
+            textarea.dispatchEvent(new Event('input', { bubbles: true }));
 
             // 4. Автоматично запускаємо пошук
             await sleep(300);
@@ -442,7 +606,7 @@
             #oscpv-modal .oscpv-overlay { position: absolute; inset: 0;
                 background: rgba(15, 23, 42, 0.45); backdrop-filter: blur(4px); }
             #oscpv-modal .oscpv-dialog { position: relative; background: #fff;
-                border-radius: 16px; width: 90%; max-width: 760px; max-height: 92vh;
+                border-radius: 16px; width: 92%; max-width: 820px; max-height: 92vh;
                 display: flex; flex-direction: column; overflow: hidden;
                 box-shadow: 0 25px 70px rgba(15, 23, 42, 0.25);
                 animation: oscpv-slideUp 0.25s ease; }
@@ -567,6 +731,12 @@
             #oscpv-modal .oscpv-birth {
                 font-size: 11px; color: #64748b; margin-top: 2px;
             }
+
+            /* sub-badge у колонці "Початок" */
+            #oscpv-modal .oscpv-mtsbu-cell { margin-top: 4px; }
+            #oscpv-modal .oscpv-mtsbu-badge { display: inline-block; padding: 2px 7px;
+                border-radius: 6px; font-size: 10px; font-weight: 600;
+                background: #ede9fe; color: #5b21b6; white-space: nowrap; }
 
             /* EMPTY STATE */
             #oscpv-modal .oscpv-empty-state { padding: 32px 16px; text-align: center; color: #94a3b8; }
@@ -693,6 +863,7 @@
         CARPLATES_CACHE.clear();
         CARPLATES_PENDING.clear();
         carplatesQueue = Promise.resolve();
+
         document.getElementById('oscpv-stat-found').textContent = '0';
         document.getElementById('oscpv-stat-empty').textContent = '0';
         document.getElementById('oscpv-stat-total').textContent = '0';
@@ -706,7 +877,7 @@
                 <thead>
                     <tr>
                         <th>ІПН</th><th>№ полісу</th><th>ПІБ</th>
-                        <th>Авто</th><th>Страховик</th><th>Рік</th><th>Збитки</th><th style="width:50px">Дані</th>
+                        <th>Авто</th><th>Страховик</th><th>Початок</th><th>Збитки</th><th style="width:50px">Дані</th>
                     </tr>
                 </thead>
                 <tbody id="oscpv-rbody"></tbody>
@@ -720,9 +891,12 @@
         log(`Старт обробки: ${ipns.length} ІПН`, 'info');
         log(`Відкриваю dict.universalna.com у фоновій вкладці...`, 'dim');
 
+        const policyStart = document.getElementById('oscpv-mtsbu-enable')?.checked || false;
+        if (policyStart) log('Увімкнено пошук дати початку полісу (бінарний пошук, ~2-3 хв на авто)', 'info');
+
         const sessionId = 'oscpv_' + Date.now();
         GM_setValue('oscpv_request_' + sessionId, JSON.stringify({
-            ipns, delayRun, delayIpn,
+            ipns, delayRun, delayIpn, policyStart,
             time: Date.now()
         }));
 
@@ -737,7 +911,7 @@
         ].join(',');
         const win = window.open(CONFIG.TABLE_URL + '#oscpv_session=' + sessionId, '_blank', dictFeatures);
         if (!win) {
-            log('ПОМИЛКА: спливаючі вікна заблоковані. Дозвольте їх для odoo.icu.int', 'err');
+            log('ПОМИЛКА: спливаючі вікна заблоковані. Дозвольте їх для цього домену Odoo', 'err');
             document.getElementById('oscpv-start').disabled = false;
             document.getElementById('oscpv-info').textContent = 'Помилка: спливаючі вікна заблоковані';
             return;
@@ -833,8 +1007,18 @@
                         ? `<button class="oscpv-copy-btn loading" data-row="${rowIdx}" title="Йде запит до carplates.app...">🔄</button>`
                         : (r.vin ? `<button class="oscpv-copy-btn" data-row="${rowIdx}" data-disabled="1" title="Парсинг авто вимкнено">📋</button>` : '');
 
-                    // Рік укладання поліса
-                    const policyYear = r.start_date || '';
+                    const exactStart = r.policy_start_exact || '';
+                    const coarseStart = r.start_date || '';
+                    const startMain = exactStart || coarseStart || '—';
+                    const startSub = exactStart
+                        ? `<div class="oscpv-mtsbu-cell"><span class="oscpv-mtsbu-badge" title="Дата початку полісу (бінарний пошук)">початок</span></div>`
+                        : '';
+                    const startCell = `
+                        <td>
+                            <div>${escapeHtml(startMain)}</div>
+                            ${startSub}
+                        </td>
+                    `;
 
                     // Збитки: показуємо pill з сумою
                     const lossAmount = parseFloat(r.total_loss_amount) || 0;
@@ -855,7 +1039,7 @@
                         <td>${escapeHtml(r.full_name || '')}</td>
                         <td>${escapeHtml(carText)}</td>
                         <td><span class="oscpv-pill oscpv-pill-ins">${escapeHtml(r.insurer_name || '')}</span></td>
-                        <td>${escapeHtml(policyYear)}</td>
+                        ${startCell}
                         <td>${lossCell}</td>
                         <td>${copyBtn}</td>
                     `;
@@ -1019,11 +1203,6 @@
 
     /**
      * Парсинг даних авто з carplates через тимчасову вкладку.
-     * Логіка:
-     *   1. Відкриваємо https://ua.carplates.app/vin/{VIN}#cp_session=X
-     *   2. У тій вкладці працює наш же скрипт (initCarplatesSide)
-     *   3. Він перехоплює нативний запит сайту до api.carplates.app/summary
-     *   4. Витягує дані, шле назад через GM_setValue, закриває вкладку
      */
     function parseCarplates(vin) {
         return new Promise((resolve, reject) => {
@@ -1034,20 +1213,17 @@
             const url = CONFIG.CARPLATES_VIN_URL + encodeURIComponent(vin) + '#cp_session=' + sessId;
             console.log('[OSCPV] Open carplates popup:', url);
 
-            // Відкриваємо як POPUP WINDOW (окреме маленьке вікно), а НЕ вкладку.
-            // Це залишає головне вікно браузера у фокусі.
-            // Маленьке вікно ховаємо за межами видимої області екрана.
             const features = [
                 'popup=yes',
                 'width=500',
                 'height=400',
-                'left=' + (screen.width - 100),  // майже за межами справа
-                'top=' + (screen.height - 100),  // майже за межами знизу
+                'left=' + (screen.width - 100),
+                'top=' + (screen.height - 100),
                 'menubar=no',
                 'toolbar=no',
                 'location=no',
                 'status=no',
-                'noopener=no',  // потрібно для window.close() з нашого боку
+                'noopener=no',
                 'noreferrer=no'
             ].join(',');
 
@@ -1062,7 +1238,6 @@
             try {
                 win.blur();
                 window.focus();
-                // Деякі браузери ігнорують blur з popup, тому ставимо інтервал
                 let focusAttempts = 0;
                 const focusInterval = setInterval(() => {
                     try { window.focus(); } catch(e) {}
@@ -1164,7 +1339,6 @@
                 GM_setValue(resKey, JSON.stringify({error: errorMsg || 'no_brand'}));
                 updateBanner('⚠ Не вдалося спарсити: ' + (errorMsg || 'no_brand'), '#dc2626');
             }
-            // Повертаємо фокус на відкривачку (Odoo) перед закриттям
             try {
                 if (window.opener && !window.opener.closed) {
                     window.opener.focus();
@@ -1175,20 +1349,16 @@
             }
         };
 
-        // Одразу при старті ховаємо своє вікно за межами екрана
-        // (popup не дає рухати без user action, але спробуємо)
         try {
             window.moveTo(screen.width - 100, screen.height - 100);
             window.resizeTo(200, 100);
         } catch(e) {}
-        // Повертаємо фокус на opener одразу як запустились
         try {
             if (window.opener && !window.opener.closed) {
                 window.opener.focus();
             }
         } catch(e) {}
 
-        // Періодично пробуємо парсити DOM поки не отримаємо марку
         const startedAt = Date.now();
         const tryParse = () => {
             if (finished) return;
@@ -1207,22 +1377,11 @@
             }
             setTimeout(tryParse, 500);
         };
-        // Стартуємо через 500мс щоб дати React відрендерити
         setTimeout(tryParse, 500);
     }
 
     /**
      * Парсимо DOM сторінки carplates.app.
-     * Структура (з HTML що ти раніше кидав):
-     *   <div>CITROEN</div><div>C5 AIRCROSS</div><div>2020</div>
-     *   <img src=".../ic_fuel.svg"><span>Паливо</span><span>ДИЗЕЛЬНЕ</span>
-     *   <img src=".../ic_engine.svg"><span>Двигун</span><span>2.0</span>     ← УВАГА: тут округлено!
-     *   <img src=".../ic_weight.svg"><span>Маса/Макс. маса</span><span>1540 / 2080</span>
-     *   <img src=".../ic_seating.svg"><span>Сидячих місць</span><span>5</span>
-     *   <span>AP</span><span>Регіон</span><span>Запорізька область</span>
-     *
-     * ВАЖЛИВО: ic_engine на сайті показує "2.0" замість "1998" - округлено.
-     * Якщо хочеш точне значення - треба з API, але з DOM беремо як є.
      */
     function extractCarplatesDataFromDOM(doc) {
         const result = {
@@ -1230,9 +1389,6 @@
             fuel: '', engine: '', weight: '', seats: '', region: ''
         };
 
-        // Характеристики через іконки SVG.
-        // ВАЖЛИВО: на сайті дані дублюються — зверху точний блок (e.g. "Об'єм двигуна: 1598"),
-        // знизу округлений ("Двигун: 2.0"). Беремо ПЕРШЕ знайдене значення (верхній блок).
         const icons = doc.querySelectorAll('img[src*="/ic_"]');
         for (const ico of icons) {
             const src = ico.getAttribute('src') || '';
@@ -1249,7 +1405,6 @@
             else if (src.includes('ic_seating') && !result.seats) result.seats = value;
         }
 
-        // Марка/модель/рік — 3 послідовні div'и. Беремо ПЕРШЕ входження (зверху точний блок).
         const allDivs = doc.querySelectorAll('div');
         for (const div of allDivs) {
             const text = (div.textContent || '').trim();
@@ -1264,155 +1419,11 @@
                     result.brand = text;
                     result.model = nextText;
                     result.year = yearMatch[0];
-                    break;  // ПЕРШЕ входження = верхній точний блок
-                }
-            }
-        }
-
-        // Регіон — ПЕРШЕ входження
-        const allSpans = doc.querySelectorAll('span');
-        for (const sp of allSpans) {
-            if ((sp.textContent || '').trim() === 'Регіон') {
-                const next = sp.nextElementSibling;
-                if (next && next.tagName === 'SPAN') {
-                    result.region = (next.textContent || '').trim();
-                    break;  // ПЕРШЕ входження
-                }
-            }
-        }
-
-        return result;
-    }
-
-
-    /**
-     * Витягуємо потрібні поля з відповіді API.
-     * Структура: { unicards: [{ id:"gov_registration", brand, model, make_year,
-     *   properties:[{label:"Регіон",value:"..."}],
-     *   properties_horizontal:[{icon:"ic_fuel",value:"БЕНЗИН"},
-     *                          {icon:"ic_engine",value:"1998"},
-     *                          {icon:"ic_weight",value:"1543 / 2035"},
-     *                          {icon:"ic_seating",value:"5"}] }] }
-     */
-    function extractCarplatesData(json) {
-        const result = {
-            brand: '', model: '', year: '',
-            fuel: '', engine: '', weight: '', seats: '', region: ''
-        };
-        if (!json || !Array.isArray(json.unicards)) return result;
-
-        // Шукаємо картку gov_registration (там основні дані)
-        let gov = json.unicards.find(u => u && u.id === 'gov_registration');
-        // Якщо її немає — пробуємо vin_decode як фолбек
-        if (!gov || !gov.brand) {
-            gov = json.unicards.find(u => u && u.id === 'vin_decode') || gov;
-        }
-        if (!gov) gov = json.unicards[0] || {};
-
-        result.brand = (gov.brand || '').toString();
-        result.model = (gov.model || '').toString();
-        result.year = (gov.make_year !== undefined && gov.make_year !== null)
-            ? String(gov.make_year) : '';
-
-        // Горизонтальні параметри: паливо, двигун, маса, місця
-        const horiz = Array.isArray(gov.properties_horizontal) ? gov.properties_horizontal : [];
-        for (const p of horiz) {
-            const ico = (p && p.icon) || '';
-            const val = (p && p.value !== undefined && p.value !== null) ? String(p.value).trim() : '';
-            if (!val) continue;
-            if (ico === 'ic_fuel') result.fuel = val;
-            else if (ico === 'ic_engine') result.engine = val;       // ВАЖЛИВО: без округлення, як є з API
-            else if (ico === 'ic_weight') result.weight = val;
-            else if (ico === 'ic_seating') result.seats = val;
-        }
-
-        // Місць може бути в горизонтальних або у vin_decode
-        if (!result.seats) {
-            const decode = json.unicards.find(u => u && u.id === 'vin_decode');
-            if (decode && Array.isArray(decode.properties_horizontal)) {
-                for (const p of decode.properties_horizontal) {
-                    if (p && p.icon === 'ic_seating' && p.value) {
-                        result.seats = String(p.value).trim();
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Регіон — у вертикальних properties
-        const vert = Array.isArray(gov.properties) ? gov.properties : [];
-        for (const p of vert) {
-            if (p && p.label === 'Регіон' && p.value) {
-                result.region = String(p.value).trim();
-                break;
-            }
-        }
-
-        return result;
-    }
-
-    /**
-     * Парсимо дані з DOM сторінки carplates.app.
-     * Структура:
-     *   <div>CITROEN</div><div>C5 AIRCROSS</div><div>2020</div>
-     *   <img src=".../ic_fuel.svg"><span>Паливо</span><span>ДИЗЕЛЬНЕ</span>
-     *   <img src=".../ic_engine.svg"><span>Двигун</span><span>2.0</span>
-     *   <img src=".../ic_weight.svg"><span>Маса/Макс. маса</span><span>1540 / 2080</span>
-     *   <img src=".../ic_seating.svg"><span>Сидячих місць</span><span>5</span>
-     *   <span>AP</span><span>Регіон</span><span>Запорізька область</span>
-     */
-    function extractCarplatesData(doc) {
-        const result = {
-            brand: '', model: '', year: '',
-            fuel: '', engine: '', weight: '', seats: '', region: ''
-        };
-
-        // Знаходимо характеристики через іконки SVG
-        // Кожна іконка має парою <span>label</span><span>value</span> в одному батьку
-        const icons = doc.querySelectorAll('img[src*="/ic_"]');
-        for (const ico of icons) {
-            const src = ico.getAttribute('src') || '';
-            const parent = ico.parentElement;
-            if (!parent) continue;
-            // Значення — останній span у батьку, label — передостанній
-            const spans = parent.querySelectorAll('span');
-            if (spans.length < 2) continue;
-            const value = (spans[spans.length - 1].textContent || '').trim();
-            if (!value) continue;
-
-            if (src.includes('ic_fuel')) result.fuel = value;
-            else if (src.includes('ic_engine')) result.engine = value;
-            else if (src.includes('ic_weight')) result.weight = value;
-            else if (src.includes('ic_seating')) result.seats = value;
-        }
-
-        // Марка/модель/рік — це 3 послідовні div'и в заголовку картки авто.
-        // Шукаємо через структуру: один з div містить великими літерами марку,
-        // наступний div - модель, наступний - рік (4 цифри).
-        const allDivs = doc.querySelectorAll('div');
-        for (const div of allDivs) {
-            // Шукаємо div зі звичайним текстом-маркою (UPPERCASE, без додаткових елементів)
-            const text = (div.textContent || '').trim();
-            if (!text || text.length > 30 || div.children.length > 0) continue;
-            // Перевіряємо чи це марка (велика латиниця, мін 3 символи)
-            if (/^[A-Z][A-Z0-9 \-]{1,28}$/.test(text) && text === text.toUpperCase()) {
-                // знаходимо наступні два <div> сіблінги
-                let next = div.nextElementSibling;
-                const nextText = next ? (next.textContent || '').trim() : '';
-                let yearEl = next ? next.nextElementSibling : null;
-                let yearText = yearEl ? (yearEl.textContent || '').trim() : '';
-                // Витягуємо рік (4 цифри) з третього div або з його початку
-                const yearMatch = yearText.match(/^(19|20)\d{2}/);
-                if (nextText && nextText.length < 60 && yearMatch) {
-                    result.brand = text;
-                    result.model = nextText;
-                    result.year = yearMatch[0];
                     break;
                 }
             }
         }
 
-        // Регіон — шукаємо span з текстом "Регіон" і беремо наступний span
         const allSpans = doc.querySelectorAll('span');
         for (const sp of allSpans) {
             if ((sp.textContent || '').trim() === 'Регіон') {
@@ -1426,6 +1437,9 @@
 
         return result;
     }
+
+
+
 
     async function finishBatch(data) {
         log(`Готово! Зібрано ${results.length} записів`, 'ok');
@@ -1434,11 +1448,10 @@
         const info = document.getElementById('oscpv-info');
 
         // Якщо є активні carplates-запити - чекаємо їх
-        if (CARPLATES_PENDING.size > 0 || carplatesQueue !== Promise.resolve()) {
+        if (CARPLATES_PENDING.size > 0) {
             if (stage) stage.innerHTML = '<div class="oscpv-spinner"></div><span>Дочікую дані авто...</span>';
             if (info) info.textContent = `Опрацьовано ОСЦПВ, чекаю carplates (${CARPLATES_PENDING.size} в роботі)...`;
             try {
-                // Чекаємо чергу (нові VIN) + всі PENDING-проміси (дублікати)
                 await carplatesQueue;
                 await Promise.all([...CARPLATES_PENDING.values()].map(p => p.catch(() => null)));
             } catch(e) {
@@ -1461,14 +1474,12 @@
     }
 
     function formatMoney(n) {
-        // Розділяємо тисячі пробілами для зручного читання: 12500 → "12 500"
         return Number(n).toLocaleString('uk-UA').replace(/,/g, ' ');
     }
 
     /**
      * Розраховує дату народження з українського ІПН (РНОКПП).
      * Перші 5 цифр — кількість днів від 31.12.1899.
-     * Повертає у форматі DD.MM.YYYY або '' якщо ІПН невалідний.
      */
     function ipnToBirthDate(ipn) {
         if (!ipn || !/^\d{10}$/.test(String(ipn))) return '';
@@ -1484,14 +1495,11 @@
 
     /**
      * Будує текст примітки для імпорту в Odoo.
-     * Формат:
-     *   Дата народження: 21.08.1988
      *
-     *   Авто 1:
-     *   Авто: KIA SPORTAGE
-     *   Рік: 2020
-     *   Двигун: БЕНЗИН 1598
-     *   ...
+     * ЗМІНА (v2.8): якщо авто не знайдено (немає жодного знайденого полісу),
+     * крім дати народження додаємо рядок
+     *   "Авто відсутнє або зареєстровано на іншу людину".
+     * Також для знайдених авто додаємо рядок з початком полісу (бінарний пошук).
      */
     function buildOdooNoteText() {
         if (!results.length) return '';
@@ -1506,15 +1514,22 @@
             lines.push('');
         }
 
-        // Збираємо унікальні авто (за VIN) щоб не дублювати
-        const seenVins = new Set();
-        const cars = [];
+        // Для кожного VIN беремо поліс з найбільшим номером (найновіший)
+        const byVin = new Map();
         for (const r of results) {
             if (r._notFound) continue;
-            const key = r.vin || `${r.vehicle_brand}-${r.plate_no}-${r.policy_no}`;
-            if (seenVins.has(key)) continue;
-            seenVins.add(key);
-            cars.push(r);
+            const key = r.vin || `${r.vehicle_brand}-${r.plate_no}`;
+            const prev = byVin.get(key);
+            if (!prev || parseInt(r.policy_no || 0) > parseInt(prev.policy_no || 0)) {
+                byVin.set(key, r);
+            }
+        }
+        const cars = [...byVin.values()];
+
+        // Жодного авто не знайдено — пишемо про відсутність
+        if (cars.length === 0) {
+            lines.push('Авто відсутнє або зареєстровано на іншу людину');
+            return lines.join('\n').trim();
         }
 
         cars.forEach((r, idx) => {
@@ -1547,6 +1562,8 @@
             if (r.policy_no) lines.push(`  Поліс №: ${r.policy_no}`);
             if (r.insurer_name) lines.push(`  Страховик: ${r.insurer_name}`);
 
+            if (r.policy_start_exact) lines.push(`  Початок полісу: ${r.policy_start_exact}`);
+
             // Збитки
             const lossAmount = parseFloat(r.total_loss_amount) || 0;
             const eventsCount = parseInt(r.insured_events_count) || 0;
@@ -1564,12 +1581,6 @@
 
     /**
      * Імпортує текст в поле "Примітка" поточного ліда в Odoo.
-     * Послідовність:
-     *   1. Будуємо текст
-     *   2. Шукаємо кнопку "Примітка" → клікаємо
-     *   3. Чекаємо поки з'явиться textarea
-     *   4. Вписуємо текст
-     *   5. Кидаємо input event щоб Owl/React побачив
      */
     async function importToOdoo() {
         const btn = document.getElementById('oscpv-import-odoo');
@@ -1584,10 +1595,8 @@
         btn.innerHTML = '<span>⏳</span> Імпорт...';
 
         try {
-            // Шукаємо кнопку "Примітка" - є кілька варіантів селекторів
             let noteBtn = document.querySelector('button.o-mail-Chatter-logNote');
             if (!noteBtn) {
-                // Альтернативний пошук по тексту
                 const buttons = Array.from(document.querySelectorAll('button'));
                 noteBtn = buttons.find(b => (b.textContent || '').trim() === 'Примітка'
                     || (b.textContent || '').trim() === 'Log note');
@@ -1598,33 +1607,26 @@
             console.log('[OSCPV] Клік на кнопку Примітка');
             noteBtn.click();
 
-            // Чекаємо textarea
             const textarea = await waitForElement('textarea.o-mail-Composer-input', 5000);
             if (!textarea) {
                 throw new Error('Не з\'явилось поле введення примітки');
             }
 
-            // Вставляємо текст через нативний setter (інакше Owl/Vue/React не побачить)
             const nativeSetter = Object.getOwnPropertyDescriptor(
                 window.HTMLTextAreaElement.prototype, 'value'
             ).set;
             nativeSetter.call(textarea, text);
 
-            // Кидаємо input event щоб фреймворк побачив зміну
             textarea.dispatchEvent(new Event('input', { bubbles: true }));
             textarea.dispatchEvent(new Event('change', { bubbles: true }));
 
-            // Фокус на поле (щоб користувач одразу побачив)
             textarea.focus();
-
-            // Розширюємо висоту автоматично
             textarea.style.height = 'auto';
             textarea.style.height = Math.min(400, textarea.scrollHeight) + 'px';
 
             btn.innerHTML = '<span>✓</span> Вставлено';
             setTimeout(() => { btn.innerHTML = origLabel; btn.disabled = false; }, 2000);
 
-            // Закриваємо нашу модалку щоб користувач побачив поле в Odoo
             setTimeout(() => closeModal(), 500);
         } catch (e) {
             console.warn('[OSCPV] importToOdoo error:', e);
@@ -1675,9 +1677,6 @@
     //                СТОРОНА DICT.UNIVERSALNA.COM (вся робота)
     // =====================================================================
 
-    // Глобальне сховище актуального токена — оновлюється при кожному запиті сайту
-    // (Sniffer вже встановлений зверху, до DOMContentLoaded)
-
     function initDictSide() {
         const hash = location.hash;
         const m = hash.match(/oscpv_session=(\w+)/);
@@ -1693,7 +1692,6 @@
         const req = JSON.parse(reqRaw);
         console.log('[OSCPV] Запуск обробки в dict-вкладці', req);
 
-        // Одразу повертаємо фокус на opener (Odoo) і пробуємо мінімізувати своє вікно
         try {
             if (window.opener && !window.opener.closed) {
                 window.opener.focus();
@@ -1704,13 +1702,10 @@
             window.resizeTo(200, 100);
         } catch(e) {}
 
-        // Показуємо банер що скрипт працює
         showDictBanner();
 
-        // Чекаємо щоб сторінка зробила хоча б один запит і ми перехопили токен
         waitForLiveToken(20000).then(token => {
             if (!token) {
-                // fallback на localStorage
                 token = localStorage.getItem('token');
             }
             if (!token) {
@@ -1732,7 +1727,6 @@
         return null;
     }
 
-    // Завжди повертає НАЙСВІЖІШИЙ токен
     function getCurrentToken() {
         return LIVE_TOKEN || localStorage.getItem('token');
     }
@@ -1792,7 +1786,6 @@
                 if (!responseJson) {
                     pushProgress(sessionId, {log: `${prefix}: ✗ не знайдено response в таблиці`, logType: 'err'});
                 } else if (responseJson.oscpv === null || (Array.isArray(responseJson.oscpv) && responseJson.oscpv.length === 0)) {
-                    // ОСЦПВ не знайдено для цього ІПН
                     pushProgress(sessionId, {
                         log: `${prefix}: ⚠ Авто відсутнє або страхування не на клієнті`,
                         logType: 'err',
@@ -1810,6 +1803,12 @@
                     });
                 } else {
                     const oscpvList = responseJson.oscpv.map(p => ({ipn, ...p}));
+
+                    // Дата початку полісу (бінарний пошук через dict/import-tool)
+                    if (req.policyStart) {
+                        await enrichPolicyStart(oscpvList, ipn, sessionId, delayRun, prefix);
+                    }
+
                     pushProgress(sessionId, {
                         log: `${prefix}: ✓ знайдено ${oscpvList.length} полісів`,
                         logType: 'ok',
@@ -1862,6 +1861,435 @@
         });
     }
 
+    // ====== ДАТА ПОЧАТКУ ПОЛІСУ (бінарний пошук через dict) ======
+    // Для поточного VIN: бінарний пошук дає точну дату поточного полісу.
+    // Попередні полісу: дата = дата_поточного - N*365 (без додаткових запитів).
+    async function enrichPolicyStart(oscpvList, ipn, sessionId, delayRun, prefix) {
+        const seen = new Set();
+        for (const pol of oscpvList) {
+            const vin = (pol.vin || '').trim();
+            if (!vin || seen.has(vin)) continue;
+            seen.add(vin);
+            try {
+                // All these are already known from the main MTSBU response — no range probe needed
+                const vinPolicies = oscpvList
+                    .filter(q => (q.vin || '').trim() === vin)
+                    .sort((a, b) => parseInt(b.policy_no || 0) - parseInt(a.policy_no || 0));
+                const newest    = vinPolicies[0];
+                const knownP0        = (newest.policy_no || '').toString();
+                const knownEnd       = newest.end_date   || '';
+                const knownPrev      = vinPolicies[1] ? (vinPolicies[1].policy_no || '').toString() : '';
+                const knownPrevEnd   = vinPolicies[1] ? (vinPolicies[1].end_date  || '') : '';
+                const startYearRaw   = parseInt(newest.start_date || '');
+                const knownStartYear = (startYearRaw >= 2000 && startYearRaw <= 2100) ? startYearRaw : 0;
+
+                pushProgress(sessionId, {log: `${prefix}: початок полісу для VIN ${vin}...`, logType: 'info'});
+                const result = await findPolicyStartByDate(ipn, vin, sessionId, delayRun, knownP0, knownEnd, knownPrev, knownPrevEnd, knownStartYear);
+                if (result) {
+                    const startDate = result.startDate || '';
+                    const p0 = (result.policyNum || '').toString();
+                    const curIdx = Math.max(0, vinPolicies.findIndex(
+                        q => (q.policy_no || '').toString() === p0
+                    ));
+                    vinPolicies.forEach((q, i) => {
+                        const stepsBack = i - curIdx;
+                        if (stepsBack === 0) {
+                            q.policy_start_exact = startDate;
+                        } else if (stepsBack > 0 && result.startDateRaw) {
+                            q.policy_start_exact = '≈ ' + uaDate(addDaysD(result.startDateRaw, stepsBack * -365));
+                        }
+                    });
+                    const prevDate = result.startDateRaw ? uaDate(addDaysD(result.startDateRaw, -365)) : '';
+                    pushProgress(sessionId, {log: `${prefix}: VIN ${vin} → початок ${startDate}` +
+                        (result.prevPolicy && prevDate ? ` (попередній ${result.prevPolicy}: ≈ ${prevDate})` : ''),
+                        logType: 'ok'});
+                } else {
+                    pushProgress(sessionId, {log: `${prefix}: VIN ${vin} — дату початку не визначено`, logType: 'err'});
+                }
+            } catch(e) {
+                console.warn('[OSCPV] enrichPolicyStart error', e);
+                pushProgress(sessionId, {log: `${prefix}: VIN ${vin} — помилка: ${e.message}`, logType: 'err'});
+            }
+        }
+    }
+
+    // All known* params come from the main MTSBU response (oscpvList) — zero extra requests to derive them.
+    // Fast path (knownPrevEnd set): 2 INSERTs + 1 RUN — handles consecutive policies in 1 step.
+    // Fallback: K=2 search (2 INSERTs per RUN, window ÷3 per step) — optimal request count.
+    async function findPolicyStartByDate(ipn, vin, sessionId, delayRun, knownP0 = '', knownEnd = '', knownPrev = '', knownPrevEnd = '', knownStartYear = 0) {
+        const today = new Date();
+        const todayISO = isoDate(today);
+
+        let P0, prevPolicy, endDate;
+
+        if (knownP0) {
+            P0 = knownP0;
+            prevPolicy = knownPrev;
+            endDate = knownEnd;
+        } else {
+            // Range probe fallback (only when called without P0 — should not happen in normal flow)
+            const lo400 = addDaysD(today, -400);
+            const lo400ISO = isoDate(lo400);
+            pushProgress(sessionId, {log: `   VIN ${vin}: діапазон ${lo400ISO}–${todayISO}...`, logType: 'dim'});
+            const allPols = await probeRangeDates(ipn, vin, lo400ISO, todayISO, delayRun, sessionId);
+            if (!allPols || !allPols.length) {
+                pushProgress(sessionId, {log: `   VIN ${vin}: на сьогодні полісу немає`, logType: 'dim'});
+                return null;
+            }
+            const sorted = allPols.slice().sort((a, b) => (b.end || '').localeCompare(a.end || ''));
+            const current = sorted.find(p => !p.end || p.end >= todayISO) || sorted[0];
+            if (!current || !current.policyNo) return null;
+            P0 = current.policyNo;
+            endDate = current.end;
+            const prevPol = sorted.find(p => p.policyNo !== P0);
+            prevPolicy = prevPol ? prevPol.policyNo : '';
+            const fullStart = uaFullDate(current.start);
+            if (fullStart) {
+                pushProgress(sessionId, {log: `   VIN ${vin}: № ${P0}, початок ${fullStart} (з діапазону)`, logType: 'dim'});
+                return { startDate: fullStart, startDateRaw: new Date(current.start), policyNum: P0, endDate, prevPolicy };
+            }
+        }
+
+        // Upper bound: day before policy end (or today).
+        const hiRef = endDate ? new Date(endDate) : new Date(today);
+        let hiD = hiRef > today ? new Date(today) : new Date(hiRef);
+        // Lower bound: start of known start_year (or 400 days back as fallback).
+        let loD = (knownStartYear >= 2000 && knownStartYear <= 2100)
+            ? new Date(`${knownStartYear}-01-01`)
+            : addDaysD(hiD, -400);
+        if (loD > hiD) loD = addDaysD(hiD, -400); // safety: year boundary edge case
+
+        const vu = vin ? vin.toUpperCase() : '';
+
+        // Fast path: 1 range INSERT [prevEnd, prevEnd+1] + 1 RUN.
+        // Range covers the boundary between prevPolicy and P0 — MTSBU returns both when start = prevEnd+1.
+        //   Both P0 + prevPolicy found → consecutive: start = d1.
+        //   Only P0 found → overlap: start = d0.
+        //   P0 not found → gap: fall through to K=2 range.
+        if (knownPrevEnd) {
+            const prevEndDate = new Date(knownPrevEnd);
+            const d0 = isoDate(prevEndDate);
+            const d1 = isoDate(addDaysD(prevEndDate, 1));
+            pushProgress(sessionId, {log: `   VIN ${vin}: № ${P0}, швидка проба [${d0}–${d1}]...`, logType: 'dim'});
+            const ins = await dictInsertProbe(ipn, d0, d1, ipn);
+            await importToolRun(ipn);
+            await sleep(delayRun);
+            const fastPols = await tryParseAllForId(extractIdFromInsert(ins), vu, sessionId);
+            const fp0   = fastPols?.find(p => p.policyNo === P0);
+            const fprev = prevPolicy ? fastPols?.find(p => p.policyNo === prevPolicy) : null;
+            pushProgress(sessionId, {log: `   VIN ${vin} [${d0}–${d1}] → P0:${fp0 ? P0 : '—'} prev:${fprev ? prevPolicy : '—'}`, logType: 'dim'});
+
+            if (fp0) {
+                const fullStart = uaFullDate(fp0.start || '');
+                // Both found → consecutive (d1); only P0 → overlap (d0); full date → exact.
+                const startISO = fullStart ? fp0.start : (fprev ? d1 : d0);
+                const startDateRaw = new Date(startISO);
+                const res = { startDate: fullStart || uaDate(startDateRaw), startDateRaw, policyNum: P0, endDate };
+                if (prevPolicy) res.prevPolicy = prevPolicy;
+                return res;
+            }
+            // P0 not in [d0, d1] — gap; narrow lower bound.
+            const afterGap = addDaysD(prevEndDate, 2);
+            if (afterGap > loD) loD = afterGap;
+            pushProgress(sessionId, {log: `   VIN ${vin}: розрив, пошук [${isoDate(loD)}–${isoDate(hiD)}]...`, logType: 'dim'});
+        } else {
+            pushProgress(sessionId, {log: `   VIN ${vin}: № ${P0}, пошук [${isoDate(loD)}–${isoDate(hiD)}]...`, logType: 'dim'});
+        }
+
+        // K=2 range: 1 INSERT [m1, m2] per RUN — half the dict requests vs 2 separate INSERTs.
+        // Presence of P0 and prevPolicy in the range response gives the same 3-way split as K=2:
+        //   only P0 → start ≤ m1 (hiD = m1);  both → start in (m1, m2] (middle third);
+        //   only prev / neither → start > m2 (loD = m2).
+        // Also terminates early if MTSBU returns the exact start_date for P0.
+        while (daysDiffD(loD, hiD) > 1) {
+            const span = daysDiffD(loD, hiD);
+            if (span <= 2) {
+                const mid = isoDate(addDaysD(loD, 1));
+                const ins = await dictInsertProbe(ipn, mid, mid, ipn);
+                await importToolRun(ipn);
+                await sleep(delayRun);
+                const r = await tryParseMultipleIds(ipn, vin, [extractIdFromInsert(ins)], sessionId);
+                pushProgress(sessionId, {log: `   VIN ${vin} @ ${mid} [${span}д] → ${r?.[0]?.policyNo || '—'}`, logType: 'dim'});
+                if (r?.[0]?.policyNo === P0) hiD = new Date(mid); else loD = new Date(mid);
+                break;
+            }
+            const m1 = isoDate(addDaysD(loD, Math.floor(span / 3)));
+            const m2 = isoDate(addDaysD(loD, Math.floor(2 * span / 3)));
+            const ins = await dictInsertProbe(ipn, m1, m2, ipn);
+            await importToolRun(ipn);
+            await sleep(delayRun);
+            const allPols  = await tryParseAllForId(extractIdFromInsert(ins), vu, sessionId);
+            const p0data   = allPols?.find(p => p.policyNo === P0);
+            const foundP0  = !!p0data;
+            const foundPrev = prevPolicy ? allPols?.some(p => p.policyNo === prevPolicy) : false;
+            pushProgress(sessionId, {log: `   VIN ${vin} [${m1}–${m2}] [${span}д] → ${foundP0 ? P0 : '—'}${foundPrev ? '+'+prevPolicy : ''}`, logType: 'dim'});
+            if (p0data) {
+                const fullStart = uaFullDate(p0data.start || '');
+                if (fullStart) {
+                    const res = { startDate: fullStart, startDateRaw: new Date(p0data.start), policyNum: P0, endDate };
+                    if (prevPolicy) res.prevPolicy = prevPolicy;
+                    return res;
+                }
+            }
+            if (foundP0 && !foundPrev) {
+                hiD = new Date(m1);     // P0 covers all of [m1,m2] → start ≤ m1
+            } else if (foundP0) {
+                loD = new Date(m1);
+                hiD = new Date(m2);     // boundary in (m1,m2] → middle third
+            } else {
+                loD = new Date(m2);     // P0 not in range → start > m2
+            }
+        }
+
+        const res = { startDate: uaDate(hiD), startDateRaw: new Date(hiD), policyNum: P0, endDate };
+        if (prevPolicy) res.prevPolicy = prevPolicy;
+        return res;
+    }
+
+    // Polls GM cache (populated by dict page fetch interceptor) until fresh rows appear.
+    // afterTs: cache entries older than this are ignored (stale from prev run).
+    async function tryParseFromApiCache(pendingIds, extractFn, afterTs, maxWaitMs) {
+        const deadline = Date.now() + maxWaitMs;
+        while (Date.now() < deadline) {
+            const raw = GM_getValue('dict444_api_cache', '');
+            if (raw) {
+                try {
+                    const { ts, rows } = JSON.parse(raw);
+                    if (ts > afterTs && Array.isArray(rows) && rows.length) {
+                        const found = new Map();
+                        for (const r of rows) {
+                            if (!pendingIds.includes(r.id)) continue;
+                            const parsed = extractFn(r.resp || '');
+                            if (parsed !== null) found.set(r.id, parsed);
+                        }
+                        if (found.size > 0) return found;
+                    }
+                } catch(e) {}
+            }
+            await sleep(600);
+        }
+        return null;
+    }
+
+    // Один або кілька ID. Три рівні швидкості:
+    // 1) fetchTableRowsDirect (GM_xmlhttpRequest, без iframe)
+    // 2) iframe tiny + GM cache (fetch interceptor в dict-контексті)
+    // 3) iframe full + DOM parsing
+    async function tryParseMultipleIds(ipn, vin, ids, sessionId) {
+        const ATTEMPT_DELAY = 3000;
+        const vu = vin ? vin.toUpperCase() : '';
+
+        const extractPol = (respText) => {
+            if (!respText) return null;
+            try {
+                const parsed = JSON.parse(respText);
+                if (!Array.isArray(parsed.oscpv) || !parsed.oscpv.length) return { policyNo: null };
+                const pol = (vu && parsed.oscpv.find(p => (p.vin || '').toUpperCase() === vu)) || parsed.oscpv[0];
+                return { policyNo: (pol.policy_no || '').toString(), start: pol.start_date || '', end: pol.end_date || '' };
+            } catch(e) { return null; }
+        };
+
+        const applyRows = (allRows, pending, results) => {
+            for (const r of allRows) {
+                if (!pending.includes(r.id) || results.has(r.id)) continue;
+                const pol = extractPol(r.resp);
+                if (pol !== null) results.set(r.id, pol);
+            }
+        };
+
+        const results = new Map();
+
+        // === Рівень 1: прямий запит (немає iframe) ===
+        let directWorked = false;
+        for (let attempt = 1; attempt <= 6 && !ids.every(id => results.has(id)); attempt++) {
+            const pending = ids.filter(id => !results.has(id));
+            try {
+                const allRows = await fetchTableRowsDirect();
+                if (allRows) {
+                    directWorked = true;
+                    applyRows(allRows, pending, results);
+                    if (ids.every(id => results.has(id))) break;
+                }
+            } catch(e) { console.log('[OSCPV] direct fetch err:', e.message); }
+            if (!directWorked) break; // URL не знайдено — одразу до iframe
+            if (attempt < 6) await sleep(ATTEMPT_DELAY);
+        }
+        if (ids.every(id => results.has(id))) return ids.map(id => results.get(id));
+
+        // === Рівень 2: iframe tiny + GM cache ===
+        for (let attempt = 1; attempt <= 8 && !ids.every(id => results.has(id)); attempt++) {
+            const pending = ids.filter(id => !results.has(id));
+            const beforeTs = Date.now();
+            const iframe = document.createElement('iframe');
+            iframe.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:400px;height:300px;border:0;';
+            iframe.src = CONFIG.TABLE_URL + '?_=' + Date.now();
+            document.body.appendChild(iframe);
+            try {
+                const cacheHit = await tryParseFromApiCache(pending, extractPol, beforeTs, 18000);
+                if (cacheHit) {
+                    for (const [id, pol] of cacheHit) results.set(id, pol);
+                    if (ids.every(id => results.has(id))) break;
+                    if (attempt < 8) await sleep(ATTEMPT_DELAY);
+                    continue;
+                }
+                // Cache didn't fire — escalate to DOM for this attempt
+                iframe.style.width = '1800px'; iframe.style.height = '1000px';
+                const rows = await waitForRows(iframe, CONFIG.ROW_WAIT_TIMEOUT);
+                if (rows.length) {
+                    const doc = iframe.contentDocument || iframe.contentWindow.document;
+                    const sorted = await clickSortAsc(doc);
+                    if (sorted) await sleep(1500);
+                    for (const row of Array.from(doc.querySelectorAll('tr.el-table__row'))) {
+                        const cells = row.querySelectorAll('td');
+                        if (cells.length < 19) continue;
+                        const cellId = parseInt((cells[COL.ID].textContent || '').trim());
+                        if (!pending.includes(cellId) || results.has(cellId)) continue;
+                        const respCell = cells[COL.RESPONSE];
+                        const respSpan = respCell && respCell.querySelector('span');
+                        const pol = extractPol(((respSpan ? respSpan.textContent : respCell?.textContent) || '').trim());
+                        if (pol !== null) results.set(cellId, pol);
+                    }
+                }
+            } finally { iframe.remove(); }
+            if (ids.every(id => results.has(id))) break;
+            if (attempt < 8) await sleep(ATTEMPT_DELAY);
+        }
+
+        return ids.map(id => results.get(id) || { policyNo: null });
+    }
+
+    // Для одного ID повертає ВСІ полісу з response-колонки (для діапазонної проби).
+    // Три рівні: fetchTableRowsDirect → iframe+cache → iframe+DOM
+    async function tryParseAllForId(id, vu, sessionId) {
+        const ATTEMPT_DELAY = 3000;
+
+        const extractAll = (respText) => {
+            if (!respText) return null;
+            try {
+                const parsed = JSON.parse(respText);
+                if (!Array.isArray(parsed.oscpv) || !parsed.oscpv.length) return [];
+                const all = parsed.oscpv.map(p => ({
+                    policyNo: (p.policy_no || '').toString(),
+                    start:    p.start_date || '',
+                    end:      p.end_date   || '',
+                    vin:      (p.vin || '').toUpperCase()
+                }));
+                return vu ? all.filter(p => !p.vin || p.vin === vu) : all;
+            } catch(e) { return null; }
+        };
+
+        // === Рівень 1: прямий запит (немає iframe) ===
+        let directWorked = false;
+        for (let attempt = 1; attempt <= 6; attempt++) {
+            try {
+                const allRows = await fetchTableRowsDirect();
+                if (allRows) {
+                    directWorked = true;
+                    const row = allRows.find(r => r.id === id);
+                    if (row?.resp) {
+                        const pols = extractAll(row.resp);
+                        if (pols !== null) return pols;
+                    }
+                }
+            } catch(e) { console.log('[OSCPV] direct fetch err:', e.message); }
+            if (!directWorked) break;
+            if (attempt < 6) await sleep(ATTEMPT_DELAY);
+        }
+
+        // === Рівень 2 + 3: iframe (cache → DOM fallback) ===
+        for (let attempt = 1; attempt <= 8; attempt++) {
+            const beforeTs = Date.now();
+            const iframe = document.createElement('iframe');
+            iframe.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:400px;height:300px;border:0;';
+            iframe.src = CONFIG.TABLE_URL + '?_=' + Date.now();
+            document.body.appendChild(iframe);
+            try {
+                const cacheHit = await tryParseFromApiCache([id], extractAll, beforeTs, 18000);
+                if (cacheHit && cacheHit.has(id)) return cacheHit.get(id);
+
+                // DOM fallback
+                iframe.style.width = '1800px'; iframe.style.height = '1000px';
+                const rows = await waitForRows(iframe, CONFIG.ROW_WAIT_TIMEOUT);
+                if (rows.length) {
+                    const doc = iframe.contentDocument || iframe.contentWindow.document;
+                    const sorted = await clickSortAsc(doc);
+                    if (sorted) await sleep(1500);
+                    for (const row of Array.from(doc.querySelectorAll('tr.el-table__row'))) {
+                        const cells = row.querySelectorAll('td');
+                        if (cells.length < 19) continue;
+                        if (parseInt((cells[COL.ID].textContent || '').trim()) !== id) continue;
+                        const respCell = cells[COL.RESPONSE];
+                        const respSpan = respCell && respCell.querySelector('span');
+                        const pols = extractAll(((respSpan ? respSpan.textContent : respCell?.textContent) || '').trim());
+                        if (pols !== null) return pols;
+                    }
+                }
+            } finally { iframe.remove(); }
+            if (attempt < 8) await sleep(ATTEMPT_DELAY);
+        }
+        return null;
+    }
+
+    // Один INSERT з діапазоном дат → 1 RUN → всі полісу за діапазон
+    async function probeRangeDates(ipn, vin, startISO, endISO, delayRun, sessionId) {
+        const inserted = await dictInsertProbe(ipn, startISO, endISO, ipn);
+        const id = extractIdFromInsert(inserted);
+        await importToolRun(ipn);
+        await sleep(delayRun);
+        const vu = vin ? vin.toUpperCase() : '';
+        return tryParseAllForId(id, vu, sessionId);
+    }
+
+    // INSERT проби: ident_code=ІПН, start_date/end_date — діапазон або точна дата
+    function dictInsertProbe(ipn, startISO, endISO, label) {
+        const payload = {
+            label_: label,
+            ident_code: ipn,
+            plate_no: null, vin: null,
+            surname: null, given_name: null, middle_name: null,
+            start_date: startISO,
+            end_date: endISO,
+            policy_type: "OSCPV",
+            server_: "P",
+            status: 0
+        };
+        const token = getCurrentToken();
+        return fetch(CONFIG.INSERT_URL, {
+            method: 'POST',
+            credentials: 'include',
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ' + token
+            },
+            body: JSON.stringify(payload)
+        }).then(r => {
+            if (!r.ok) throw new Error('PROBE INSERT HTTP ' + r.status);
+            return r.json();
+        });
+    }
+
+    // ── Дата-утиліти ──
+    function isoDate(d) { return d.toISOString().slice(0, 10); }                 // YYYY-MM-DD
+    function uaDate(d) {
+        return [d.getDate(), d.getMonth() + 1, d.getFullYear()]
+            .map(n => String(n).padStart(2, '0')).join('.');                      // DD.MM.YYYY
+    }
+    function addDaysD(d, n) { const r = new Date(d); r.setDate(r.getDate() + n); return r; }
+    function daysDiffD(a, b) { return Math.round((b.getTime() - a.getTime()) / 86400000); }
+
+    // Повертає DD.MM.YYYY лише якщо рядок — ПОВНА дата (а не рік). Інакше ''.
+    function uaFullDate(s) {
+        if (!s) return '';
+        s = String(s).trim();
+        let m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);            // YYYY-MM-DD
+        if (m) return `${m[3]}.${m[2]}.${m[1]}`;
+        m = s.match(/^(\d{2})\.(\d{2})\.(\d{4})/);              // DD.MM.YYYY
+        if (m) return `${m[1]}.${m[2]}.${m[3]}`;
+        return '';
+    }
+
+
     function extractIdFromInsert(response) {
         if (!response) return null;
         if (typeof response === 'number') return response;
@@ -1894,77 +2322,80 @@
         });
     }
 
-    /**
-     * Парсимо таблицю через iframe з поллінгом:
-     * перезавантажуємо iframe декілька разів поки не знайдемо рядок
-     * з потрібним id ТА заповненим полем response.
-     */
+    // Tier 1: direct HTTP fetch; Tier 2: iframe DOM fallback.
     async function parseTableForIpn(ipn, expectedId, sessionId) {
-        const MAX_ATTEMPTS = 12;        // максимум спроб
-        const ATTEMPT_DELAY = 3000;     // мс між спробами
+        const MAX_ATTEMPTS = 12;
+        const ATTEMPT_DELAY = 3000;
+        let directKnown = null; // null=not tried, true=URL works, false=URL unavailable
 
         for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-            if (sessionId) {
-                pushProgress(sessionId, {
-                    log: `   спроба ${attempt}/${MAX_ATTEMPTS} (id=${expectedId})...`,
-                    logType: 'dim'
-                });
+            if (sessionId) pushProgress(sessionId, {
+                log: `   спроба ${attempt}/${MAX_ATTEMPTS} (id=${expectedId})...`,
+                logType: 'dim'
+            });
+
+            if (directKnown !== false) {
+                try {
+                    const allRows = await fetchTableRowsDirect();
+                    if (allRows !== null) {
+                        directKnown = true;
+                        const row = expectedId ? allRows.find(r => r.id === expectedId) : null;
+                        if (row?.resp) {
+                            try {
+                                const parsed = JSON.parse(row.resp);
+                                if (sessionId) pushProgress(sessionId, {log: `   ✓ id=${expectedId} знайдено`, logType: 'ok'});
+                                return parsed;
+                            } catch(e) {
+                                if (sessionId) pushProgress(sessionId, {log: `   ⚠ response не JSON`, logType: 'err'});
+                                return null;
+                            }
+                        }
+                        if (sessionId) pushProgress(sessionId, {
+                            log: row ? `   id=${expectedId} є, resp порожній — чекаю...`
+                                     : `   id=${expectedId} ще не з'явився — чекаю...`,
+                            logType: 'dim'
+                        });
+                        if (attempt < MAX_ATTEMPTS) await sleep(ATTEMPT_DELAY);
+                        continue;
+                    }
+                    directKnown = false; // URL not cached yet — fall through to iframe
+                } catch(e) {
+                    directKnown = false;
+                }
             }
 
+            // Iframe fallback (used when direct fetch URL is not yet cached)
             const result = await tryParseOnce(ipn, expectedId);
 
             if (result.found && result.responseText) {
-                // знайшли рядок і поле response непорожнє
                 try {
                     const parsed = JSON.parse(result.responseText);
-                    if (sessionId) {
-                        pushProgress(sessionId, {
-                            log: `   ✓ знайдено id=${result.foundId}, response довжина=${result.responseText.length}`,
-                            logType: 'ok'
-                        });
-                    }
+                    if (sessionId) pushProgress(sessionId, {log: `   ✓ знайдено id=${result.foundId}`, logType: 'ok'});
                     return parsed;
                 } catch(e) {
                     console.warn('[OSCPV] response не JSON:', result.responseText.slice(0, 300));
-                    if (sessionId) {
-                        pushProgress(sessionId, {
-                            log: `   ⚠ response не JSON: ${result.responseText.slice(0,80)}...`,
-                            logType: 'err'
-                        });
-                    }
+                    if (sessionId) pushProgress(sessionId, {
+                        log: `   ⚠ response не JSON: ${result.responseText.slice(0,80)}...`,
+                        logType: 'err'
+                    });
                     return null;
                 }
             }
 
             if (result.found && !result.responseText) {
-                if (sessionId) {
-                    pushProgress(sessionId, {
-                        log: `   рядок id=${result.foundId} є, але response ще порожній — чекаю...`,
-                        logType: 'dim'
-                    });
-                }
+                if (sessionId) pushProgress(sessionId, {log: `   рядок id=${result.foundId} є, але response ще порожній — чекаю...`, logType: 'dim'});
             } else if (!result.found) {
-                if (sessionId) {
-                    pushProgress(sessionId, {
-                        log: `   рядок з id=${expectedId} ще не з'явився — чекаю...`,
-                        logType: 'dim'
-                    });
-                }
+                if (sessionId) pushProgress(sessionId, {log: `   рядок з id=${expectedId} ще не з'явився — чекаю...`, logType: 'dim'});
             }
 
-            if (attempt < MAX_ATTEMPTS) {
-                await sleep(ATTEMPT_DELAY);
-            }
+            if (attempt < MAX_ATTEMPTS) await sleep(ATTEMPT_DELAY);
         }
 
         return null;
     }
 
     /**
-     * Одна спроба парсингу:
-     * відкриваємо свіжий iframe, чекаємо рендеру таблиці,
-     * клікаємо на сортування ASC по колонці id (це у цій таблиці дає найбільший id зверху),
-     * чекаємо перерендеру, знаходимо рядок з потрібним id.
+     * Одна спроба парсингу через свіжий iframe.
      */
     async function tryParseOnce(ipn, expectedId) {
         const iframe = document.createElement('iframe');
@@ -1973,57 +2404,41 @@
         document.body.appendChild(iframe);
 
         try {
-            // 1. Чекаємо щоб з'явились хоч якісь рядки
             let rows = await waitForRows(iframe, CONFIG.ROW_WAIT_TIMEOUT);
             if (!rows.length) return { found: false };
 
-            // 2. Клікаємо на стрілку ascending у заголовку колонки id
-            //    (в цій таблиці ASC = від більшого до меншого, тобто найсвіжіший зверху)
             const doc = iframe.contentDocument || iframe.contentWindow.document;
             const sorted = await clickSortAsc(doc);
 
-            // 3. Чекаємо щоб таблиця перерендерилась після сортування
             if (sorted) {
                 await sleep(1500);
             }
 
-            // 4. Перечитуємо рядки після сортування
             rows = Array.from(doc.querySelectorAll('tr.el-table__row'));
             if (!rows.length) return { found: false };
 
-            // 5. Якщо знаємо id — шукаємо точно по ньому через span.cell-number
             if (expectedId) {
-                const idSpans = doc.querySelectorAll('span.cell-number');
-                let targetRow = null;
-                for (const span of idSpans) {
-                    const v = parseInt((span.textContent || '').trim());
-                    if (v === expectedId) {
-                        targetRow = span.closest('tr.el-table__row');
-                        break;
-                    }
-                }
-
-                if (targetRow) {
-                    const cells = targetRow.querySelectorAll('td');
-                    if (cells.length >= 19) {
+                for (const row of rows) {
+                    const cells = row.querySelectorAll('td');
+                    if (cells.length < 19) continue;
+                    const cellId = parseInt((cells[COL.ID].textContent || '').trim());
+                    if (cellId === expectedId) {
                         const respCell = cells[COL.RESPONSE];
                         const respSpan = respCell && respCell.querySelector('span');
                         const respText = ((respSpan ? respSpan.textContent : respCell?.textContent) || '').trim();
                         return { found: true, foundId: expectedId, responseText: respText };
                     }
                 }
-                // не знайшли по id — повертаємо not found щоб поллер спробував ще
                 return { found: false };
             }
 
-            // Фолбек на випадок без expectedId — беремо ПЕРШИЙ рядок з потрібним ident_code
-            // (після ASC-сортування він буде найсвіжіший)
             for (const row of rows) {
                 const cells = row.querySelectorAll('td');
                 if (cells.length < 19) continue;
                 const idText = (cells[COL.ID].textContent || '').trim();
                 const identText = (cells[COL.IDENT_CODE].textContent || '').trim();
-                if (identText === String(ipn)) {
+                const labelText = cells[COL.LABEL] ? (cells[COL.LABEL].textContent || '').trim() : '';
+                if (identText === String(ipn) || labelText === String(ipn)) {
                     const respCell = cells[COL.RESPONSE];
                     const respSpan = respCell && respCell.querySelector('span');
                     const respText = ((respSpan ? respSpan.textContent : respCell?.textContent) || '').trim();
@@ -2042,11 +2457,9 @@
 
     /**
      * Знаходить у заголовку таблиці колонку id та клікає на стрілку sort-caret.ascending.
-     * Повертає true якщо клік виконано.
      */
     async function clickSortAsc(doc) {
         try {
-            // Колонка id — перший th (el-table_1_column_1)
             const idHeader = doc.querySelector('th.el-table_1_column_1');
             if (!idHeader) {
                 console.warn('[OSCPV] th колонки id не знайдено');
@@ -2058,16 +2471,11 @@
                 return false;
             }
 
-            // Якщо стрілка вже активна — не клікаємо
             if (ascCaret.classList.contains('active')) {
                 console.log('[OSCPV] ASC сортування вже активне');
                 return true;
             }
 
-            // Клікаємо. Element UI слухає клік на батьківському <span class="head-sort">,
-            // тому імітуємо нативний клік через MouseEvent.
-            const clickTarget = ascCaret.closest('.head-sort') || ascCaret;
-            // деякі версії Element UI реагують на клік саме по caret, тому клікаємо обидва
             ['mousedown', 'mouseup', 'click'].forEach(type => {
                 ascCaret.dispatchEvent(new MouseEvent(type, {
                     bubbles: true, cancelable: true, view: doc.defaultView
@@ -2081,26 +2489,6 @@
         }
     }
 
-    // Фолбек на випадок якщо ми не знаємо id (insert не повернув його) —
-    // шукаємо за ident_code і беремо рядок з найбільшим id
-    function findByIdentCode(rows, ipn) {
-        const matches = [];
-        for (const row of rows) {
-            const cells = row.querySelectorAll('td');
-            if (cells.length < 19) continue;
-            const idText = (cells[COL.ID].textContent || '').trim();
-            const identText = (cells[COL.IDENT_CODE].textContent || '').trim();
-            if (identText === String(ipn)) {
-                const respCell = cells[COL.RESPONSE];
-                const respSpan = respCell && respCell.querySelector('span');
-                const respText = ((respSpan ? respSpan.textContent : respCell?.textContent) || '').trim();
-                matches.push({ id: parseInt(idText) || 0, responseText: respText });
-            }
-        }
-        if (!matches.length) return { found: false };
-        matches.sort((a, b) => b.id - a.id);
-        return { found: true, foundId: matches[0].id, responseText: matches[0].responseText };
-    }
 
     function waitForRows(iframe, timeoutMs) {
         return new Promise(resolve => {
@@ -2113,7 +2501,6 @@
                 } catch(e) { /* ще не готовий */ }
 
                 if (rows.length > 0) {
-                    // дочекаємось ще трохи щоб response повністю прорендерився
                     setTimeout(() => {
                         try {
                             const doc = iframe.contentDocument || iframe.contentWindow.document;
