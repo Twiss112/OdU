@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         OSCPV B2C — Пошук полісів (Odoo + Universalna)
 // @namespace    universalna.oscpv.b2c
-// @version      2.12.0-b2c
-// @description  B2C: ОСЦПВ + дані авто (carplates) + дата початку полісу (бінарний пошук через dict/import-tool)
+// @version      2.14.0-b2c
+// @description  B2C: ОСЦПВ через incore.universalna.com + дані авто (carplates) + дата початку полісу
 // @author       Universalna Baza
 // @match        https://odoo.icu.int/*
+// @match        https://odoo.universalna.com/*
 // @match        https://dict.universalna.com/*
 // @match        https://ua.carplates.app/*
+// @match        https://incore.universalna.com/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
@@ -17,6 +19,7 @@
 // @grant        unsafeWindow
 // @connect      import-tool.universalna.com
 // @connect      dict.universalna.com
+// @connect      incore.universalna.com
 // @run-at       document-start
 // ==/UserScript==
 
@@ -29,18 +32,22 @@
     const CONFIG = {
         TABLE_URL: 'https://dict.universalna.com/table/444',
         INSERT_URL: 'https://dict.universalna.com/api/24/insert/InsuredLoss?zip=true&idtbl=444',
-        RUN_URL: 'https://import-tool.universalna.com/api/task/MtsbuInsuredLoss_PROD/run',
+        RUN_URL: 'https://import-tool.universalna.com/api/task/MtsbuInsuredLoss_PROD/run',  // legacy fallback
         DELAY_AFTER_RUN: 1500,
         DELAY_BETWEEN_IPN: 1500,
         ROW_WAIT_TIMEOUT: 30000,
         ROW_WAIT_INTERVAL: 500,
 
         // Carplates налаштування
-        CARPLATES_VIN_URL: 'https://ua.carplates.app/vin/',  // куди відкривати вкладку
-        CARPLATES_API_URL: 'https://api.carplates.app/summary', // що перехоплювати у вкладці
-        CARPLATES_TIMEOUT: 25000,   // мс - макс. час очікування у вкладці carplates
-        CARPLATES_DELAY: 800,       // мс - пауза між VIN-запитами
+        CARPLATES_VIN_URL: 'https://ua.carplates.app/vin/',
+        CARPLATES_API_URL: 'https://api.carplates.app/summary',
+        CARPLATES_TIMEOUT: 25000,
+        CARPLATES_DELAY: 800,
 
+        // Incore - новий endpoint для генерації звіту
+        INCORE_REPORT_GID: '6775b281-c15d-4bba-a238-6c3832843032',
+        INCORE_FORM_URL: 'https://incore.universalna.com/ReportingServicesReports/ReportsPage?ReportGID=6775b281-c15d-4bba-a238-6c3832843032',
+        INCORE_GENERATE_URL: 'https://incore.universalna.com/ReportingServicesReports/ReportsPage?ReportGID=6775b281-c15d-4bba-a238-6c3832843032&handler=GenerateReport&PageNumber=1',
     };
 
     // Глобальне сховище актуального токена — оновлюється при кожному запиті сайту
@@ -258,13 +265,17 @@
     //                    РОУТИНГ ПО САЙТАМ
     // =====================================================================
     const host = location.hostname;
+    // Обидва домени Odoo - старий і новий
+    const isOdooHost = (host === 'odoo.icu.int' || host === 'odoo.universalna.com');
 
-    if (host === 'odoo.icu.int') {
+    if (isOdooHost) {
         initOdooSide();
     } else if (host === 'dict.universalna.com') {
         initDictSide();
     } else if (host === 'ua.carplates.app') {
         initCarplatesSide();
+    } else if (host === 'incore.universalna.com') {
+        initIncoreSide();
     }
 
 
@@ -392,6 +403,13 @@
                                 <div class="oscpv-setting-row">
                                     <input type="number" id="oscpv-delay-ipn" value="${CONFIG.DELAY_BETWEEN_IPN}" min="0" step="500">
                                     <span class="oscpv-unit">мс</span>
+                                </div>
+                            </div>
+                            <div class="oscpv-setting">
+                                <label>🚀 К-сть потоків</label>
+                                <div class="oscpv-setting-row">
+                                    <input type="number" id="oscpv-concurrency" value="3" min="1" max="10" step="1">
+                                    <span class="oscpv-unit">шт</span>
                                 </div>
                             </div>
                         </div>
@@ -664,7 +682,7 @@
                 padding: 2px 8px; border-radius: 6px; font-weight: 600; }
 
             /* SETTINGS */
-            #oscpv-modal .oscpv-settings-grid { display: grid; grid-template-columns: 1fr 1fr;
+            #oscpv-modal .oscpv-settings-grid { display: grid; grid-template-columns: repeat(3, 1fr);
                 gap: 10px; margin-top: 10px; }
             #oscpv-modal .oscpv-setting { background: #f8fafc; border: 1px solid #e2e8f0;
                 border-radius: 10px; padding: 10px 12px; }
@@ -842,6 +860,7 @@
 
         const delayRun = parseInt(document.getElementById('oscpv-delay-run').value) || CONFIG.DELAY_AFTER_RUN;
         const delayIpn = parseInt(document.getElementById('oscpv-delay-ipn').value) || CONFIG.DELAY_BETWEEN_IPN;
+        const concurrency = parseInt(document.getElementById('oscpv-concurrency').value) || 3;
 
         // Готуємо UI для обробки
         document.getElementById('oscpv-start').disabled = true;
@@ -893,7 +912,7 @@
 
         const sessionId = 'oscpv_' + Date.now();
         GM_setValue('oscpv_request_' + sessionId, JSON.stringify({
-            ipns, delayRun, delayIpn, policyStart,
+            ipns, delayRun, delayIpn, concurrency, policyStart,
             time: Date.now()
         }));
 
@@ -908,7 +927,7 @@
         ].join(',');
         const win = window.open(CONFIG.TABLE_URL + '#oscpv_session=' + sessionId, '_blank', dictFeatures);
         if (!win) {
-            log('ПОМИЛКА: спливаючі вікна заблоковані. Дозвольте їх для odoo.icu.int', 'err');
+            log('ПОМИЛКА: спливаючі вікна заблоковані. Дозвольте їх для цього домену Odoo', 'err');
             document.getElementById('oscpv-start').disabled = false;
             document.getElementById('oscpv-info').textContent = 'Помилка: спливаючі вікна заблоковані';
             return;
@@ -932,7 +951,11 @@
             if (!newV) return;
             try {
                 const data = JSON.parse(newV);
-                handleProgressUpdate(data, ipns.length);
+                if (data.batch) {
+                    data.batch.forEach(item => handleProgressUpdate(item, ipns.length));
+                } else {
+                    handleProgressUpdate(data, ipns.length);
+                }
             } catch(e) {}
         });
 
@@ -1671,6 +1694,95 @@
 
 
     // =====================================================================
+    //         СТОРОНА INCORE.UNIVERSALNA.COM — захоплення CSRF токена
+    // =====================================================================
+    // Логіка:
+    //   1. Користувач відкриває https://incore.universalna.com/ReportingServicesReports/ReportsPage?ReportGID=...
+    //   2. Наш скрипт автоматично знаходить __RequestVerificationToken у формі
+    //   3. Зберігає його в GM_setValue для подальшого використання
+    //   4. Показує банер з підтвердженням що токен збережено
+    function initIncoreSide() {
+        // Працюємо тільки на сторінці звіту OSCPV (ReportGID нашого звіту)
+        const url = location.href;
+        if (!url.includes(CONFIG.INCORE_REPORT_GID)) {
+            console.log('[OSCPV] incore: звичайний візит, скрипт пасивний');
+            return;
+        }
+
+        console.log('[OSCPV] ===== INCORE TOKEN CAPTURE =====');
+
+        const captureToken = () => {
+            const input = document.querySelector('input[name="__RequestVerificationToken"]');
+            if (!input || !input.value) return false;
+
+            const token = input.value;
+            const saved = GM_getValue('oscpv_incore_token', '');
+            if (saved === token) {
+                console.log('[OSCPV] incore token unchanged, length:', token.length);
+                showIncoreBanner('✓ Токен вже збережено (без змін)', '#0d9488');
+                return true;
+            }
+            GM_setValue('oscpv_incore_token', token);
+            GM_setValue('oscpv_incore_token_at', Date.now());
+            console.log('[OSCPV] incore token saved, length:', token.length);
+            showIncoreBanner('✓ Токен для пошуку OSCPV збережено. Тепер можете запускати пошук з Odoo.', '#0d9488');
+            return true;
+        };
+
+        // Спроба захопити одразу
+        if (document.readyState !== 'loading') {
+            if (!captureToken()) waitForForm();
+        } else {
+            document.addEventListener('DOMContentLoaded', () => {
+                if (!captureToken()) waitForForm();
+            });
+        }
+
+        function waitForForm() {
+            // Можливо форма ще не зрендерилась — чекаємо через MutationObserver
+            const started = Date.now();
+            const observer = new MutationObserver(() => {
+                if (captureToken()) {
+                    observer.disconnect();
+                } else if (Date.now() - started > 10000) {
+                    observer.disconnect();
+                    showIncoreBanner('⚠ Не знайдено токен на сторінці', '#dc2626');
+                }
+            });
+            if (document.body) {
+                observer.observe(document.body, { childList: true, subtree: true });
+            }
+            // також періодична перевірка на випадок якщо MO не спрацює
+            const interval = setInterval(() => {
+                if (captureToken() || Date.now() - started > 10000) clearInterval(interval);
+            }, 500);
+        }
+    }
+
+    function showIncoreBanner(text, color) {
+        const tryShow = () => {
+            if (!document.body) { setTimeout(tryShow, 100); return; }
+            let bannerEl = document.getElementById('oscpv-incore-banner');
+            if (!bannerEl) {
+                bannerEl = document.createElement('div');
+                bannerEl.id = 'oscpv-incore-banner';
+                bannerEl.style.cssText = `
+                    position: fixed; top: 0; left: 0; right: 0;
+                    color: #fff; padding: 12px 20px; text-align: center;
+                    font-family: 'Inter', -apple-system, Arial, sans-serif;
+                    font-size: 14px; font-weight: 600;
+                    z-index: 2147483647; box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+                `;
+                document.body.appendChild(bannerEl);
+            }
+            bannerEl.style.background = color || '#83639D';
+            bannerEl.innerHTML = '🛡️ OSCPV B2C: ' + text;
+        };
+        tryShow();
+    }
+
+
+    // =====================================================================
     //                СТОРОНА DICT.UNIVERSALNA.COM (вся робота)
     // =====================================================================
 
@@ -1728,9 +1840,19 @@
         return LIVE_TOKEN || localStorage.getItem('token');
     }
 
+    let dictPendingProgress = [];
+    let dictProgressTimer = null;
     function pushProgress(sessionId, payload) {
         payload._ts = Date.now() + Math.random();
-        GM_setValue('oscpv_progress_' + sessionId, JSON.stringify(payload));
+        dictPendingProgress.push(payload);
+        if (!dictProgressTimer) {
+            dictProgressTimer = setTimeout(() => {
+                const batch = dictPendingProgress;
+                dictPendingProgress = [];
+                dictProgressTimer = null;
+                GM_setValue('oscpv_progress_' + sessionId, JSON.stringify({ batch }));
+            }, 100);
+        }
     }
 
     function pushResult(sessionId, payload) {
@@ -1757,77 +1879,102 @@
     }
 
     async function processBatch(sessionId, req) {
-        const { ipns, delayRun, delayIpn } = req;
+        const { ipns, delayRun, delayIpn, concurrency = 3 } = req;
         const today = new Date().toISOString().slice(0, 10);
 
-        for (let i = 0; i < ipns.length; i++) {
-            const ipn = ipns[i];
-            const prefix = `[${i+1}/${ipns.length}] ${ipn}`;
-            updateBanner(`${i+1}/${ipns.length}`);
+        let completedCount = 0;
+        let runningCount = 0;
+        let index = -1;
 
-            try {
-                pushProgress(sessionId, {log: `${prefix}: INSERT в dict...`, logType: 'dim'});
-                const inserted = await dictInsert(ipn, today);
-                const newId = extractIdFromInsert(inserted);
-                pushProgress(sessionId, {log: `${prefix}: створено id=${newId || '?'}`, logType: 'dim'});
-
-                pushProgress(sessionId, {log: `${prefix}: RUN на import-tool...`, logType: 'dim'});
-                await importToolRun(ipn);
-
-                pushProgress(sessionId, {log: `${prefix}: чекаю ${delayRun}мс обробку...`, logType: 'info'});
-                await sleep(delayRun);
-
-                pushProgress(sessionId, {log: `${prefix}: парсинг таблиці...`, logType: 'dim'});
-                const responseJson = await parseTableForIpn(ipn, newId, sessionId);
-
-                if (!responseJson) {
-                    pushProgress(sessionId, {log: `${prefix}: ✗ не знайдено response в таблиці`, logType: 'err'});
-                } else if (responseJson.oscpv === null || (Array.isArray(responseJson.oscpv) && responseJson.oscpv.length === 0)) {
-                    pushProgress(sessionId, {
-                        log: `${prefix}: ⚠ Авто відсутнє або страхування не на клієнті`,
-                        logType: 'err',
-                        progress: i + 1,
-                        newResults: [{
-                            ipn,
-                            policy_no: '—',
-                            full_name: 'Авто відсутнє або страхування не на клієнті',
-                            vehicle_brand: '',
-                            vehicle_title: '',
-                            plate_no: '',
-                            insurer_name: '',
-                            _notFound: true
-                        }]
-                    });
-                } else {
-                    const oscpvList = responseJson.oscpv.map(p => ({ipn, ...p}));
-
-                    // Дата початку полісу (бінарний пошук через dict/import-tool)
-                    if (req.policyStart) {
-                        await enrichPolicyStart(oscpvList, ipn, sessionId, delayRun, prefix);
-                    }
-
-                    pushProgress(sessionId, {
-                        log: `${prefix}: ✓ знайдено ${oscpvList.length} полісів`,
-                        logType: 'ok',
-                        progress: i + 1,
-                        newResults: oscpvList
-                    });
+        return new Promise((resolve) => {
+            function processNext() {
+                if (index >= ipns.length - 1 && runningCount === 0) {
+                    pushResult(sessionId, {done: true});
+                    updateBanner('завершено ✓');
+                    setTimeout(() => window.close(), 3000);
+                    resolve();
+                    return;
                 }
+                while (runningCount < concurrency && index < ipns.length - 1) {
+                    index++;
+                    runningCount++;
+                    const i = index;
+                    const ipn = ipns[i];
+                    const prefix = `[${i+1}/${ipns.length}] ${ipn}`;
+                    updateBanner(`${completedCount}/${ipns.length}`);
 
-                if (i < ipns.length - 1) await sleep(delayIpn);
-            } catch(e) {
-                console.error(e);
-                pushProgress(sessionId, {
-                    log: `${prefix}: ПОМИЛКА ${e.message}`,
-                    logType: 'err',
-                    progress: i + 1
-                });
+                    (async () => {
+                        try {
+                            pushProgress(sessionId, {log: `${prefix}: INSERT в dict...`, logType: 'dim'});
+                            const inserted = await dictInsert(ipn, today);
+                            const newId = extractIdFromInsert(inserted);
+                            pushProgress(sessionId, {log: `${prefix}: створено id=${newId || '?'}`, logType: 'dim'});
+
+                            pushProgress(sessionId, {log: `${prefix}: RUN на incore...`, logType: 'dim'});
+                            await importToolRun(ipn);
+
+                            pushProgress(sessionId, {log: `${prefix}: чекаю ${delayRun}мс обробку...`, logType: 'info'});
+                            await sleep(delayRun);
+
+                            pushProgress(sessionId, {log: `${prefix}: парсинг таблиці...`, logType: 'dim'});
+                            const responseJson = await parseTableForIpn(ipn, newId, sessionId);
+
+                            completedCount++;
+                            updateBanner(`${completedCount}/${ipns.length}`);
+
+                            if (!responseJson) {
+                                pushProgress(sessionId, {log: `${prefix}: ✗ не знайдено response в таблиці`, logType: 'err', progress: completedCount});
+                            } else if (responseJson.oscpv === null || (Array.isArray(responseJson.oscpv) && responseJson.oscpv.length === 0)) {
+                                pushProgress(sessionId, {
+                                    log: `${prefix}: ⚠ Авто відсутнє або страхування не на клієнті`,
+                                    logType: 'err',
+                                    progress: completedCount,
+                                    newResults: [{
+                                        ipn,
+                                        policy_no: '—',
+                                        full_name: 'Авто відсутнє або страхування не на клієнті',
+                                        vehicle_brand: '',
+                                        vehicle_title: '',
+                                        plate_no: '',
+                                        insurer_name: '',
+                                        _notFound: true
+                                    }]
+                                });
+                            } else {
+                                const oscpvList = responseJson.oscpv.map(p => ({ipn, ...p}));
+
+                                // Дата початку полісу (бінарний пошук через dict/import-tool)
+                                if (req.policyStart) {
+                                    await enrichPolicyStart(oscpvList, ipn, sessionId, delayRun, prefix);
+                                }
+
+                                pushProgress(sessionId, {
+                                    log: `${prefix}: ✓ знайдено ${oscpvList.length} полісів`,
+                                    logType: 'ok',
+                                    progress: completedCount,
+                                    newResults: oscpvList
+                                });
+                            }
+
+                            if (delayIpn > 0) await sleep(delayIpn);
+                        } catch(e) {
+                            console.error(e);
+                            completedCount++;
+                            updateBanner(`${completedCount}/${ipns.length}`);
+                            pushProgress(sessionId, {
+                                log: `${prefix}: ПОМИЛКА ${e.message}`,
+                                logType: 'err',
+                                progress: completedCount
+                            });
+                        } finally {
+                            runningCount--;
+                            processNext();
+                        }
+                    })();
+                }
             }
-        }
-
-        pushResult(sessionId, {done: true});
-        updateBanner('завершено ✓');
-        setTimeout(() => window.close(), 3000);
+            processNext();
+        });
     }
 
     function dictInsert(ipn, today) {
@@ -1993,48 +2140,59 @@
             pushProgress(sessionId, {log: `   VIN ${vin}: № ${P0}, пошук [${isoDate(loD)}–${isoDate(hiD)}]...`, logType: 'dim'});
         }
 
-        // K=2 range: 1 INSERT [m1, m2] per RUN — half the dict requests vs 2 separate INSERTs.
-        // Presence of P0 and prevPolicy in the range response gives the same 3-way split as K=2:
-        //   only P0 → start ≤ m1 (hiD = m1);  both → start in (m1, m2] (middle third);
-        //   only prev / neither → start > m2 (loD = m2).
-        // Also terminates early if MTSBU returns the exact start_date for P0.
+        // K=4 points parallel search per RUN — speeds up binary search without getting banned.
+        const K = 4;
         while (daysDiffD(loD, hiD) > 1) {
             const span = daysDiffD(loD, hiD);
-            if (span <= 2) {
-                const mid = isoDate(addDaysD(loD, 1));
-                const ins = await dictInsertProbe(ipn, mid, mid, ipn);
-                await importToolRun(ipn);
-                await sleep(delayRun);
-                const r = await tryParseMultipleIds(ipn, vin, [extractIdFromInsert(ins)], sessionId);
-                pushProgress(sessionId, {log: `   VIN ${vin} @ ${mid} [${span}д] → ${r?.[0]?.policyNo || '—'}`, logType: 'dim'});
-                if (r?.[0]?.policyNo === P0) hiD = new Date(mid); else loD = new Date(mid);
-                break;
+            const points = Math.min(span - 1, K);
+            
+            const dates = [];
+            for (let i = 1; i <= points; i++) {
+                dates.push(isoDate(addDaysD(loD, Math.floor(span * i / (points + 1)))));
             }
-            const m1 = isoDate(addDaysD(loD, Math.floor(span / 3)));
-            const m2 = isoDate(addDaysD(loD, Math.floor(2 * span / 3)));
-            const ins = await dictInsertProbe(ipn, m1, m2, ipn);
+            
+            const ids = [];
+            for (const d of dates) {
+                const ins = await dictInsertProbe(ipn, d, d, ipn);
+                ids.push(extractIdFromInsert(ins));
+                await sleep(250); // Small pause to avoid rate limit bans
+            }
+            
             await importToolRun(ipn);
             await sleep(delayRun);
-            const allPols  = await tryParseAllForId(extractIdFromInsert(ins), vu, sessionId);
-            const p0data   = allPols?.find(p => p.policyNo === P0);
-            const foundP0  = !!p0data;
-            const foundPrev = prevPolicy ? allPols?.some(p => p.policyNo === prevPolicy) : false;
-            pushProgress(sessionId, {log: `   VIN ${vin} [${m1}–${m2}] [${span}д] → ${foundP0 ? P0 : '—'}${foundPrev ? '+'+prevPolicy : ''}`, logType: 'dim'});
-            if (p0data) {
-                const fullStart = uaFullDate(p0data.start || '');
-                if (fullStart) {
-                    const res = { startDate: fullStart, startDateRaw: new Date(p0data.start), policyNum: P0, endDate };
-                    if (prevPolicy) res.prevPolicy = prevPolicy;
-                    return res;
+            
+            const rList = await tryParseMultipleIds(ipn, vin, ids, sessionId);
+            
+            let firstTrueIdx = -1;
+            let exactFullStart = ''; 
+            for (let i = 0; i < points; i++) {
+                const pol = rList[i];
+                if (pol && pol.policyNo === P0) {
+                    firstTrueIdx = i;
+                    if (pol.start) {
+                        const full = uaFullDate(pol.start);
+                        if (full) exactFullStart = full;
+                    }
+                    break;
                 }
             }
-            if (foundP0 && !foundPrev) {
-                hiD = new Date(m1);     // P0 covers all of [m1,m2] → start ≤ m1
-            } else if (foundP0) {
-                loD = new Date(m1);
-                hiD = new Date(m2);     // boundary in (m1,m2] → middle third
+            
+            pushProgress(sessionId, {log: `   VIN ${vin} [${span}д]: ${points} проб → ${firstTrueIdx >= 0 ? dates[firstTrueIdx] : '—'}`, logType: 'dim'});
+            
+            if (exactFullStart) {
+                const parts = exactFullStart.split('.');
+                const res = { startDate: exactFullStart, startDateRaw: new Date(`${parts[2]}-${parts[1]}-${parts[0]}`), policyNum: P0, endDate };
+                if (prevPolicy) res.prevPolicy = prevPolicy;
+                return res;
+            }
+            
+            if (firstTrueIdx === -1) {
+                loD = new Date(dates[points - 1]);
+            } else if (firstTrueIdx === 0) {
+                hiD = new Date(dates[0]);
             } else {
-                loD = new Date(m2);     // P0 not in range → start > m2
+                loD = new Date(dates[firstTrueIdx - 1]);
+                hiD = new Date(dates[firstTrueIdx]);
             }
         }
 
@@ -2296,25 +2454,72 @@
         return null;
     }
 
+    /**
+     * Запускає генерацію звіту через incore.universalna.com.
+     * Це замінило старий `importToolRun` що ходив на import-tool.
+     *
+     * Логіка:
+     *   1. Беремо __RequestVerificationToken з GM_setValue
+     *      (захоплюється коли користувач відкриває incore-сторінку — initIncoreSide)
+     *   2. Робимо POST на /ReportingServicesReports/ReportsPage?...&handler=GenerateReport
+     *      з form-encoded payload: d1, d2, label, ident_code, SelectedExportType, __RequestVerificationToken
+     *   3. Сервер створить/оновить запис у dict, який потім ми парсимо як зараз
+     *
+     * Якщо токен не збережено / застарів - кидаємо помилку з підказкою користувачу.
+     */
     function importToolRun(ipn) {
-        const token = getCurrentToken();
+        const token = GM_getValue('oscpv_incore_token', '');
+        if (!token) {
+            return Promise.reject(new Error(
+                'Немає incore-токена. Відкрийте https://incore.universalna.com/ReportingServicesReports/ReportsPage?ReportGID=' +
+                CONFIG.INCORE_REPORT_GID + ' щоб скрипт зловив __RequestVerificationToken, потім повторіть пошук.'
+            ));
+        }
+
+        // Дата — сьогодні в форматі DD.MM.YYYY (як у прикладі: 18.06.2026)
+        const today = new Date();
+        const dd = String(today.getDate()).padStart(2, '0');
+        const mm = String(today.getMonth() + 1).padStart(2, '0');
+        const yyyy = today.getFullYear();
+        const dateStr = `${dd}.${mm}.${yyyy}`;
+
+        // application/x-www-form-urlencoded payload
+        const params = new URLSearchParams();
+        params.set('d1', dateStr);
+        params.set('d2', dateStr);
+        params.set('label', String(ipn));
+        params.set('ident_code', '');
+        params.set('SelectedExportType', 'EXCELOPENXML');
+        params.set('__RequestVerificationToken', token);
+
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: 'POST',
-                url: CONFIG.RUN_URL,
+                url: CONFIG.INCORE_GENERATE_URL,
                 headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': 'Bearer ' + token
+                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                    'Accept': '*/*',
+                    'Origin': 'https://incore.universalna.com',
+                    'Referer': CONFIG.INCORE_FORM_URL,
+                    'X-Requested-With': 'XMLHttpRequest'
                 },
-                data: JSON.stringify({ ImportLabel: ipn }),
+                data: params.toString(),
                 onload: r => {
                     if (r.status >= 200 && r.status < 300) {
                         resolve(r.responseText);
+                    } else if (r.status === 400 || r.status === 401 || r.status === 403) {
+                        // токен застарів - чистимо щоб користувач заново відкрив incore
+                        GM_deleteValue('oscpv_incore_token');
+                        reject(new Error(
+                            'incore HTTP ' + r.status + ' — токен застарів. ' +
+                            'Відкрийте https://incore.universalna.com/ReportingServicesReports/ReportsPage?ReportGID=' +
+                            CONFIG.INCORE_REPORT_GID + ' щоб оновити токен.'
+                        ));
                     } else {
-                        reject(new Error('RUN HTTP ' + r.status));
+                        reject(new Error('incore HTTP ' + r.status));
                     }
                 },
-                onerror: () => reject(new Error('RUN network error'))
+                onerror: () => reject(new Error('incore network error'))
             });
         });
     }
