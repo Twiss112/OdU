@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         МТСБУ — пакетна перевірка полісів ОСЦПВ
 // @namespace    universalna.mtsbu.batch
-// @version      3.2.1
+// @version      3.2.7
 // @description  Пакетна перевірка чинності ОСЦПВ через policy.mtsbu.ua: черга, авто-заповнення форми, авто-проходження Turnstile, бінарний пошук дати початку (поточний поліс для reg/VIN), CSV-експорт. Стиль МТСБУ.
 // @author       Twis
 // @match        https://policy.mtsbu.ua/*
@@ -302,15 +302,14 @@
         if (document.getElementById('mtsbu-style')) return;
         const s = document.createElement('style'); s.id = 'mtsbu-style';
         s.textContent = `
-        #mtsbu-panel,#mtsbu-bar,#mtsbu-cap{--green:#398450;--green2:#0BAB64;--ghov:#5db778;--gtint:#eff5f1;--blue:#1d70c9;--ring:#66b1f8;--btint:rgba(29,112,201,.05);--red:#f50000;--rtint:rgba(245,0,0,.05);--ink:#333;--muted:#6d727c;--line:#dae0ea;--iline:#d2d2d7;--bline:#d6d6d6;--ok:#19be6f;
+        #mtsbu-panel,#mtsbu-bar,#mtsbu-cap,#mtsbu-handle{--green:#398450;--green2:#0BAB64;--ghov:#5db778;--gtint:#eff5f1;--blue:#1d70c9;--ring:#66b1f8;--btint:rgba(29,112,201,.05);--red:#f50000;--rtint:rgba(245,0,0,.05);--ink:#333;--muted:#6d727c;--line:#dae0ea;--iline:#d2d2d7;--bline:#d6d6d6;--ok:#19be6f;
             font-family:Montserrat,-apple-system,"Segoe UI",Roboto,Arial,sans-serif}
-        #mtsbu-panel{position:fixed;top:0;right:0;height:100vh;width:400px;max-width:92vw;z-index:999999;background:#fff;color:var(--ink);border-left:1px solid var(--line);box-shadow:-6px 0 24px rgba(51,51,51,.14);display:flex;flex-direction:column;transform:translateX(100%);transition:transform .28s cubic-bezier(.4,0,.2,1)}
+        #mtsbu-panel{position:fixed;top:0;right:0;height:100vh;width:400px;max-width:92vw;z-index:2147483647;background:#fff;color:var(--ink);border-left:1px solid var(--line);box-shadow:-6px 0 24px rgba(51,51,51,.14);display:flex;flex-direction:column;transform:translateX(100%);transition:transform .28s cubic-bezier(.4,0,.2,1)}
         #mtsbu-panel.open{transform:translateX(0)}
-        #mtsbu-handle{position:fixed;top:50%;right:0;transform:translateY(-50%);z-index:999999;display:flex;flex-direction:column;align-items:center;gap:8px;background:radial-gradient(140% 600% at 100% 100%,var(--green) 40%,var(--green2) 95%);color:#fff;border:0;border-radius:10px 0 0 10px;padding:16px 9px;cursor:pointer;box-shadow:-3px 0 12px rgba(51,51,51,.2);transition:right .28s cubic-bezier(.4,0,.2,1)}
+        #mtsbu-handle{position:fixed;top:50%;right:0;transform:translateY(-50%);z-index:2147483647;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;background:radial-gradient(140% 600% at 100% 100%,var(--green) 40%,var(--green2) 95%) !important;color:#fff !important;border:0 !important;border-radius:8px 0 0 8px;padding:0;width:36px;height:64px;cursor:pointer;box-shadow:-3px 0 12px rgba(51,51,51,.2);transition:right .28s cubic-bezier(.4,0,.2,1)}
         #mtsbu-handle:hover{filter:brightness(1.05)}
-        #mtsbu-handle .chev{font-size:16px;font-weight:700;line-height:1;margin-bottom:2px}
-        #mtsbu-handle .lab{writing-mode:vertical-rl;transform:rotate(180deg);text-orientation:sideways;font:700 12px Montserrat,Arial;letter-spacing:.06em}
-        #mtsbu-handle .bdg{font:700 10px Montserrat,Arial;background:rgba(255,255,255,.24);border-radius:50px;padding:2px 5px;margin-top:6px;writing-mode:horizontal-tb}
+        #mtsbu-handle .chev{font-size:22px;font-weight:700;line-height:1;color:#fff !important;margin-top:2px}
+        #mtsbu-handle .bdg{font:700 10px/1 Montserrat,Arial;background:rgba(255,255,255,.24) !important;border-radius:50px;padding:3px 0;width:26px;text-align:center;color:#fff !important;margin-bottom:4px}
         #mtsbu-panel .hd{background:radial-gradient(120% 25600% at 100% 100%,var(--green) 48.69%,var(--green2) 84.64%);color:#fff !important;padding:20px 24px;display:flex;justify-content:space-between;align-items:center;flex:none}
         #mtsbu-panel .hd .t{font-weight:700;font-size:18px;line-height:1.2;color:#fff !important}
         #mtsbu-panel .hd .t small{display:block;font-weight:400;font-size:12px;opacity:.85;margin-top:2px;color:#fff !important}
@@ -365,21 +364,23 @@
         #mtsbu-panel li .dot-wrap{margin-left:auto;padding-left:12px;flex:none;display:flex;align-items:center}
         #mtsbu-panel li .dot-wrap .d{width:8px;height:8px;border-radius:50%}
         #mtsbu-panel li .li-sub{font:400 13px/1.4 Montserrat,Arial;color:var(--muted)}
-        #mtsbu-flash{position:fixed;bottom:24px;right:24px;z-index:1000000;max-width:360px;background:#fff;color:var(--ink);border:1px solid var(--iline);border-left:4px solid var(--green);padding:16px 20px;border-radius:4px;font:500 14px/21px Montserrat,Arial;box-shadow:0 3px 12px rgba(51,51,51,.18)}
+        #mtsbu-flash{position:fixed;bottom:24px;right:24px;z-index:2147483647;max-width:360px;background:#fff;color:var(--ink);border:1px solid var(--iline);border-left:4px solid var(--green);padding:16px 20px;border-radius:4px;font:500 14px/21px Montserrat,Arial;box-shadow:0 3px 12px rgba(51,51,51,.18)}
         #mtsbu-flash.err{border-left-color:var(--red)}
-        #mtsbu-bar{position:fixed;top:24px;left:50%;transform:translateX(-50%);z-index:999999;background:#fff;border:1px solid var(--iline);border-radius:4px;padding:12px 16px 12px 20px;display:flex;align-items:center;gap:16px;box-shadow:0 3px 12px rgba(51,51,51,.16);width:max-content;max-width:94vw;font:14px Montserrat,Arial;color:var(--ink)}
-        #mtsbu-bar > span { display:flex; flex-direction:column; min-width:0; flex:1; }
-        #mtsbu-bar .row { display:flex; align-items:center; gap:12px; min-width:0; }
-        #mtsbu-bar .v{font:700 16px/24px Montserrat,Arial;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-        #mtsbu-bar .st{display:flex;align-items:center;gap:8px;font-weight:600;white-space:nowrap}
+        #mtsbu-bar{position:fixed;top:24px;left:50%;transform:translateX(-50%);z-index:2147483647;background:#fff;border:1px solid var(--iline);border-left:4px solid var(--green);border-radius:4px;padding:12px 16px 12px 20px;display:flex;align-items:center;gap:16px;box-shadow:0 3px 12px rgba(51,51,51,.16);width:380px;max-width:94vw;box-sizing:border-box;font:14px Montserrat,Arial;color:var(--ink)}
+        #mtsbu-bar > span { display:flex; flex-direction:column; min-width:0; flex:1; gap:2px; }
+        #mtsbu-bar .row { display:flex; align-items:center; justify-content:space-between; gap:12px; min-width:0; }
+        #mtsbu-bar .v{font:700 15px/22px Montserrat,Arial;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink)}
+        #mtsbu-bar .st{display:flex;align-items:center;gap:8px;font:600 14px/22px Montserrat,Arial;white-space:nowrap;color:var(--ink);flex:none}
         #mtsbu-bar .st .d{width:8px;height:8px;border-radius:50%}
-        #mtsbu-bar .meta{color:var(--muted);font:400 12px/16px Montserrat,Arial;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        #mtsbu-bar .meta{color:var(--muted);font:400 13px/18px Montserrat,Arial;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        #mtsbu-bar b, #mtsbu-cap b { font-weight:700 !important; color:var(--ink) !important; font-size:inherit !important; font-family:Montserrat,Arial,sans-serif !important; }
         #mtsbu-bar button{border:0;border-radius:3px;padding:10px 24px;background:var(--green);color:#fff;font:700 14px/21px Montserrat,Arial;cursor:pointer;transition:.2s;white-space:nowrap;flex:none}
         #mtsbu-bar button:hover{background:var(--ghov)}
         #mtsbu-bar .cd{color:var(--muted);font-size:13px;flex:none;width:24px;text-align:right}
-        #mtsbu-cap{position:fixed;top:90px;left:50%;transform:translateX(-50%);z-index:1000000;background:#fff;color:var(--ink);border:1px solid var(--iline);border-left:4px solid var(--blue);border-radius:4px;padding:16px 20px;text-align:left;font:14px/21px Montserrat,Arial;box-shadow:0 3px 14px rgba(51,51,51,.16)}
+        #mtsbu-cap{position:fixed;top:90px;left:50%;transform:translateX(-50%);z-index:2147483647;background:#fff;color:var(--ink);border:1px solid var(--iline);border-left:4px solid var(--green);border-radius:4px;padding:12px 16px 12px 20px;text-align:left;font:14px/21px Montserrat,Arial;box-shadow:0 3px 12px rgba(51,51,51,.16);display:flex;flex-direction:column;gap:2px;width:380px;max-width:94vw;box-sizing:border-box}
         #mtsbu-cap.manual{border-left-color:var(--red)}
-        #mtsbu-cap b{font:600 16px/24px Montserrat,Arial}#mtsbu-cap .sub{font:400 13px/18px Montserrat,Arial;margin-top:4px;color:var(--muted)}
+        #mtsbu-cap b{font:700 15px/22px Montserrat,Arial !important;display:block}
+        #mtsbu-cap .sub{font:400 13px/18px Montserrat,Arial;color:var(--muted)}
         #mtsbu-panel .hd .x{background:rgba(255,255,255,.2);color:#fff !important;border:0;border-radius:50px;width:30px;height:30px;font-size:18px;line-height:1;cursor:pointer;margin-left:12px;flex:none;transition:background .2s}
         #mtsbu-panel .hd .x:hover{background:rgba(255,255,255,.32)}
         #mtsbu-panel .hd .right{display:flex;align-items:center;gap:0}`;
@@ -397,11 +398,19 @@
     function cfWaitBanner(stuck) { styleOnce(); let b = document.getElementById('mtsbu-cap'); if (!b) { b = document.createElement('div'); b.id = 'mtsbu-cap'; document.body.appendChild(b); } b.className = stuck ? 'manual' : ''; b.innerHTML = `<b>Cloudflare перевіряє браузер…</b><div class="sub">${stuck ? 'Якщо просить — пройди перевірку.' : 'Зачекай 1–3 с, сторінка відкриється сама.'}</div>`; }
 
     function doneList(items) {
-        return `<ul>${items.map((q) => `<li class="${q.status === 'pending' ? 'cur' : ''}"><div class="li-main"><span class="v">${esc(q.value)}</span><span class="tag">${q.type}</span><span class="dot-wrap">${dot(statKind(q.status))}</span></div><div class="li-sub">${esc(statShort(q.status))}${q.startDate ? ' · ' + esc(q.startDate) : ''}</div></li>`).join('')}</ul>`;
+        return `<ul>${items.map((q) => {
+            let sub = esc(statShort(q.status));
+            if (q.startDate && !sub.includes(q.startDate)) sub += ' · ' + esc(q.startDate);
+            return `<li class="${q.status === 'pending' ? 'cur' : ''}"><div class="li-main"><span class="v">${esc(q.value)}</span><span class="tag">${q.type}</span><span class="dot-wrap">${dot(statKind(q.status))}</span></div><div class="li-sub">${sub}</div></li>`;
+        }).join('')}</ul>`;
     }
     function renderPanel() {
         styleOnce();
-        if (!panelEl) { panelEl = document.createElement('div'); panelEl.id = 'mtsbu-panel'; document.body.appendChild(panelEl); }
+        let isNew = false;
+        if (!panelEl) { 
+            panelEl = document.createElement('div'); panelEl.id = 'mtsbu-panel'; 
+            isNew = true;
+        }
         const running = flow === 'filling' && pointer < queue.length;
         const hasResults = Object.keys(results).length > 0;
         const doneAll = !running && queue.length > 0 && hasResults;
@@ -434,6 +443,15 @@
               ${hasResults ? `<span class="link" id="csv">Експорт попереднього результату</span>` : ''}`;
         }
         panelEl.innerHTML = `<div class="hd"><span class="t">${title}<small>${sub}</small></span><span class="right">${counter}<button class="x" id="mt-close" title="Згорнути">×</button></span></div><div class="bd">${body}</div>`;
+        if (isNew) {
+            panelEl.style.transition = 'none';
+            panelEl.classList.toggle('open', !ui.collapsed);
+            document.body.appendChild(panelEl);
+            void panelEl.offsetHeight; // force layout
+            panelEl.style.transition = '';
+        } else {
+            panelEl.classList.toggle('open', !ui.collapsed);
+        }
         const $ = (id) => panelEl.querySelector('#' + id);
         const persist = () => { const t = $('t'), dt = $('dt'); if (t) ui.text = t.value; if (dt) ui.date = dt.value.trim() || today(); save(K.ui, ui); };
         $('mt-close').onclick = () => { ui.collapsed = true; save(K.ui, ui); applyDrawer(); };
@@ -453,21 +471,28 @@
     function ensureHandle() {
         styleOnce();
         let h = document.getElementById('mtsbu-handle');
+        let isNew = false;
         if (!h) {
             h = document.createElement('button'); h.id = 'mtsbu-handle'; h.title = 'Пакетна перевірка ОСЦПВ';
-            document.body.appendChild(h);
-            h.onclick = () => { ui.collapsed = !ui.collapsed; save(K.ui, ui); applyDrawer(); };
+            isNew = true;
         }
         const done = queue.filter((q) => q.status !== 'pending').length;
         const badge = queue.length ? `<span class="bdg">${done}/${queue.length}</span>` : '';
-        h.innerHTML = `<span class="chev">${ui.collapsed ? '‹' : '›'}</span><span class="lab">СКРИПТ</span>${badge}`;
+        h.innerHTML = `<span class="chev">${ui.collapsed ? '›' : '‹'}</span>${badge}`;
+        if (isNew) {
+            h.style.transition = 'none';
+            h.style.right = ui.collapsed ? '0px' : '400px';
+            document.body.appendChild(h);
+            void h.offsetHeight; // force layout
+            h.style.transition = '';
+            h.onclick = () => { ui.collapsed = !ui.collapsed; save(K.ui, ui); applyDrawer(); };
+        }
     }
     function applyDrawer() {
         if (panelEl) panelEl.classList.toggle('open', !ui.collapsed);
         const h = document.getElementById('mtsbu-handle');
         if (h) {
-            ensureHandle();
-            const w = panelEl ? panelEl.getBoundingClientRect().width : 384;
+            const w = panelEl ? (panelEl.getBoundingClientRect().width || 400) : 384;
             h.style.right = ui.collapsed ? '0px' : w + 'px';
         }
     }
@@ -502,8 +527,8 @@
     function init() {
         try {
             if (isCfChallenge()) { cfWaitBanner(false); setTimeout(() => { if (isCfChallenge()) cfWaitBanner(true); }, 12000); return; }
-            if (isResultPage()) { handleResultPage(); return; }
             renderPanel();
+            if (isResultPage()) { handleResultPage(); return; }
             if (flow === 'filling') proceedFill();
         } catch (e) {
             console.error('[МТСБУ скрипт]', e);
@@ -514,5 +539,5 @@
     function boot() { init(); }
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
     else boot();
-    setTimeout(() => { if (!document.getElementById('mtsbu-panel') && !document.getElementById('mtsbu-handle') && !isResultPage()) { try { renderPanel(); } catch (e) {} } }, 1500);
+    setTimeout(() => { if (!document.getElementById('mtsbu-panel') && !document.getElementById('mtsbu-handle')) { try { renderPanel(); } catch (e) {} } }, 1500);
 })();
